@@ -21,6 +21,8 @@ const messageReactions = new Map();
 const roomThemes = new Map();
 // Store chat history
 const chatHistory = new Map();
+// Store room users with names
+const roomUsers = new Map();
 
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
@@ -44,6 +46,12 @@ io.on('connection', (socket) => {
     }
     rooms.get(pin).add(socket.id);
     
+    // Add user to room users
+    if (!roomUsers.has(pin)) {
+      roomUsers.set(pin, []);
+    }
+    roomUsers.get(pin).push({ socketId: socket.id, userName: userName });
+    
     // Send current theme if exists
     if (roomThemes.has(pin)) {
       socket.emit('theme_changed', { theme: roomThemes.get(pin) });
@@ -51,6 +59,9 @@ io.on('connection', (socket) => {
     
     // Send user count update
     io.to(pin).emit('user_count_update', { count: rooms.get(pin).size });
+    
+    // Send current users list
+    io.to(pin).emit('current_users', { users: roomUsers.get(pin) });
     
     // Send chat history if exists
     if (chatHistory.has(pin)) {
@@ -64,6 +75,13 @@ io.on('connection', (socket) => {
     });
     
     console.log(`User ${socket.id} (${userName}) joined room ${pin}`);
+  });
+
+  socket.on('get_current_users', (data) => {
+    const { pin } = data;
+    if (roomUsers.has(pin)) {
+      socket.emit('current_users', { users: roomUsers.get(pin) });
+    }
   });
 
   socket.on('send_message', (data) => {
@@ -143,6 +161,9 @@ io.on('connection', (socket) => {
     if (chatHistory.has(pin)) {
       chatHistory.delete(pin);
     }
+    if (roomUsers.has(pin)) {
+      roomUsers.delete(pin);
+    }
     
     // Notify all users in the room
     io.to(pin).emit('room_deleted');
@@ -158,6 +179,14 @@ io.on('connection', (socket) => {
       if (rooms.has(pin)) {
         rooms.get(pin).delete(socket.id);
         
+        // Remove user from room users
+        if (roomUsers.has(pin)) {
+          roomUsers.set(pin, roomUsers.get(pin).filter(user => user.socketId !== socket.id));
+          
+          // Update current users list
+          io.to(pin).emit('current_users', { users: roomUsers.get(pin) });
+        }
+        
         // Update user count
         io.to(pin).emit('user_count_update', { count: rooms.get(pin).size });
         
@@ -168,6 +197,9 @@ io.on('connection', (socket) => {
               rooms.delete(pin);
               if (roomThemes.has(pin)) {
                 roomThemes.delete(pin);
+              }
+              if (roomUsers.has(pin)) {
+                roomUsers.delete(pin);
               }
               console.log(`Room ${pin} cleared (no users)`);
             }
@@ -194,6 +226,14 @@ io.on('connection', (socket) => {
       if (rooms.has(socket.room)) {
         rooms.get(socket.room).delete(socket.id);
         
+        // Remove user from room users
+        if (roomUsers.has(socket.room)) {
+          roomUsers.set(socket.room, roomUsers.get(socket.room).filter(user => user.socketId !== socket.id));
+          
+          // Update current users list
+          io.to(socket.room).emit('current_users', { users: roomUsers.get(socket.room) });
+        }
+        
         // Update user count
         io.to(socket.room).emit('user_count_update', { count: rooms.get(socket.room).size });
         
@@ -204,6 +244,9 @@ io.on('connection', (socket) => {
               rooms.delete(socket.room);
               if (roomThemes.has(socket.room)) {
                 roomThemes.delete(socket.room);
+              }
+              if (roomUsers.has(socket.room)) {
+                roomUsers.delete(socket.room);
               }
               console.log(`Room ${socket.room} cleared (no users)`);
             }
