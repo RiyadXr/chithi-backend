@@ -23,8 +23,8 @@ const roomThemes = new Map();
 const chatHistory = new Map();
 // Store room users with names
 const roomUsers = new Map();
-// Store seen status for messages
-const messageSeenStatus = new Map();
+// Store message status (sent, delivered, seen)
+const messageStatus = new Map();
 
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
@@ -76,26 +76,25 @@ io.on('connection', (socket) => {
       userName: userName
     });
 
-    // Update seen status for all messages when user joins
+    // Update message status for all messages when user joins
     if (chatHistory.has(pin)) {
       chatHistory.get(pin).forEach(message => {
-        if (!messageSeenStatus.has(message.messageId)) {
-          messageSeenStatus.set(message.messageId, new Set());
+        if (message.type === 'received') {
+          // Update status to delivered for all received messages
+          if (!messageStatus.has(message.messageId)) {
+            messageStatus.set(message.messageId, {});
+          }
+          messageStatus.get(message.messageId).delivered = true;
+          
+          // Notify sender about delivery
+          const sender = roomUsers.get(pin).find(user => user.userName === message.sender);
+          if (sender) {
+            io.to(sender.socketId).emit('message_status_update', {
+              messageId: message.messageId,
+              status: 'delivered'
+            });
+          }
         }
-        messageSeenStatus.get(message.messageId).add(socket.id);
-      });
-      
-      // Notify about seen status updates
-      io.to(pin).emit('message_seen_update', {
-        messages: Array.from(messageSeenStatus.entries()).filter(([messageId, seenBy]) => {
-          return chatHistory.get(pin).some(msg => msg.messageId === messageId);
-        }).map(([messageId, seenBy]) => ({
-          messageId,
-          seenBy: Array.from(seenBy).map(socketId => {
-            const user = roomUsers.get(pin).find(u => u.socketId === socketId);
-            return user ? user.userName : 'Unknown';
-          })
-        }))
       });
     }
     
@@ -128,12 +127,10 @@ io.on('connection', (socket) => {
       chatHistory.set(pin, chatHistory.get(pin).slice(-100));
     }
 
-    // Initialize seen status for this message
-    if (!messageSeenStatus.has(messageId)) {
-      messageSeenStatus.set(messageId, new Set());
+    // Initialize status for this message
+    if (!messageStatus.has(messageId)) {
+      messageStatus.set(messageId, {});
     }
-    // Mark as seen by sender immediately
-    messageSeenStatus.get(messageId).add(socket.id);
     
     // Broadcast message to others in the room
     socket.to(pin).emit('message', {
@@ -144,16 +141,34 @@ io.on('connection', (socket) => {
       replyTo: replyTo
     });
 
-    // Send immediate seen status update
-    io.to(pin).emit('message_seen_update', {
-      messages: [{
-        messageId,
-        seenBy: Array.from(messageSeenStatus.get(messageId)).map(socketId => {
-          const user = roomUsers.get(pin).find(u => u.socketId === socketId);
-          return user ? user.userName : 'Unknown';
-        })
-      }]
-    });
+    // Update status to delivered if there are other users
+    if (rooms.has(pin) && rooms.get(pin).size > 1) {
+      messageStatus.get(messageId).delivered = true;
+      socket.emit('message_status_update', {
+        messageId: messageId,
+        status: 'delivered'
+      });
+    }
+  });
+
+  socket.on('message_delivered', (data) => {
+    const { pin, messageId } = data;
+    
+    if (messageStatus.has(messageId)) {
+      messageStatus.get(messageId).delivered = true;
+      
+      // Notify sender about delivery
+      const message = chatHistory.get(pin)?.find(msg => msg.messageId === messageId);
+      if (message) {
+        const sender = roomUsers.get(pin)?.find(user => user.userName === message.sender);
+        if (sender) {
+          io.to(sender.socketId).emit('message_status_update', {
+            messageId: messageId,
+            status: 'delivered'
+          });
+        }
+      }
+    }
   });
 
   socket.on('message_reaction', (data) => {
@@ -175,23 +190,25 @@ io.on('connection', (socket) => {
     });
   });
 
-  socket.on('message_seen', (data) => {
+  socket.on('unsend_message', (data) => {
     const { pin, messageId } = data;
     
-    if (messageSeenStatus.has(messageId)) {
-      messageSeenStatus.get(messageId).add(socket.id);
-      
-      // Broadcast seen status update
-      io.to(pin).emit('message_seen_update', {
-        messages: [{
-          messageId,
-          seenBy: Array.from(messageSeenStatus.get(messageId)).map(socketId => {
-            const user = roomUsers.get(pin).find(u => u.socketId === socketId);
-            return user ? user.userName : 'Unknown';
-          })
-        }]
-      });
+    // Remove message from history
+    if (chatHistory.has(pin)) {
+      chatHistory.set(pin, chatHistory.get(pin).filter(msg => msg.messageId !== messageId));
     }
+    
+    // Remove message status
+    if (messageStatus.has(messageId)) {
+      messageStatus.delete(messageId);
+    }
+    
+    // Broadcast unsend to all users in the room
+    io.to(pin).emit('message_unsent', {
+      messageId: messageId
+    });
+    
+    console.log(`Message ${messageId} unsent in room ${pin}`);
   });
 
   socket.on('typing_start', (data) => {
@@ -231,9 +248,9 @@ io.on('connection', (socket) => {
       roomUsers.delete(pin);
     }
     
-    // Clear message seen status for this room
-    Array.from(messageSeenStatus.keys()).forEach(messageId => {
-      messageSeenStatus.delete(messageId);
+    // Clear message status for this room
+    Array.from(messageStatus.keys()).forEach(messageId => {
+      messageStatus.delete(messageId);
     });
     
     // Notify all users in the room
