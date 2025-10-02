@@ -15,6 +15,8 @@ const io = socketIo(server, {
 
 // Store active rooms and their users
 const rooms = new Map();
+// Store message reactions
+const messageReactions = new Map();
 
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
@@ -44,13 +46,33 @@ io.on('connection', (socket) => {
   });
 
   socket.on('send_message', (data) => {
-    const { pin, message, timestamp } = data;
+    const { pin, message, timestamp, messageId } = data;
     
     // Broadcast message to others in the room
     socket.to(pin).emit('message', {
       message: message,
       sender: 'Other User',
-      timestamp: timestamp
+      timestamp: timestamp,
+      messageId: messageId
+    });
+  });
+
+  socket.on('message_reaction', (data) => {
+    const { pin, messageId, reaction } = data;
+    
+    // Store reaction
+    const reactionKey = `${pin}-${messageId}`;
+    if (!messageReactions.has(reactionKey)) {
+      messageReactions.set(reactionKey, {});
+    }
+    
+    const reactions = messageReactions.get(reactionKey);
+    reactions[reaction] = (reactions[reaction] || 0) + 1;
+    
+    // Broadcast reaction to room
+    io.to(pin).emit('message_reaction', {
+      messageId: messageId,
+      reaction: reaction
     });
   });
 
