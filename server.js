@@ -19,6 +19,8 @@ const rooms = new Map();
 const messageReactions = new Map();
 // Store room themes
 const roomThemes = new Map();
+// Store chat history
+const chatHistory = new Map();
 
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
@@ -47,6 +49,14 @@ io.on('connection', (socket) => {
       socket.emit('theme_changed', { theme: roomThemes.get(pin) });
     }
     
+    // Send user count update
+    io.to(pin).emit('user_count_update', { count: rooms.get(pin).size });
+    
+    // Send chat history if exists
+    if (chatHistory.has(pin)) {
+      socket.emit('chat_history', { messages: chatHistory.get(pin) });
+    }
+    
     // Notify others in the room
     socket.to(pin).emit('user_joined', { 
       message: 'A user joined the chat',
@@ -58,6 +68,19 @@ io.on('connection', (socket) => {
 
   socket.on('send_message', (data) => {
     const { pin, message, timestamp, messageId, sender } = data;
+    
+    // Store message in history
+    if (!chatHistory.has(pin)) {
+      chatHistory.set(pin, []);
+    }
+    chatHistory.get(pin).push({
+      message, sender, timestamp, messageId, type: 'received'
+    });
+    
+    // Keep only last 100 messages
+    if (chatHistory.get(pin).length > 100) {
+      chatHistory.set(pin, chatHistory.get(pin).slice(-100));
+    }
     
     // Broadcast message to others in the room
     socket.to(pin).emit('message', {
@@ -110,19 +133,57 @@ io.on('connection', (socket) => {
   socket.on('delete_room', (data) => {
     const { pin } = data;
     
+    // Clear room data
+    if (rooms.has(pin)) {
+      rooms.delete(pin);
+    }
+    if (roomThemes.has(pin)) {
+      roomThemes.delete(pin);
+    }
+    if (chatHistory.has(pin)) {
+      chatHistory.delete(pin);
+    }
+    
     // Notify all users in the room
     io.to(pin).emit('room_deleted');
     
-    // Clear room data after a delay (to allow clients to receive the message)
-    setTimeout(() => {
+    console.log(`Room ${pin} deleted`);
+  });
+
+  socket.on('leave_room', (data) => {
+    const { pin } = data;
+    
+    if (socket.room === pin) {
+      // Remove user from room
       if (rooms.has(pin)) {
-        rooms.delete(pin);
+        rooms.get(pin).delete(socket.id);
+        
+        // Update user count
+        io.to(pin).emit('user_count_update', { count: rooms.get(pin).size });
+        
+        // If room is empty, delete it after a delay
+        if (rooms.get(pin).size === 0) {
+          setTimeout(() => {
+            if (rooms.has(pin) && rooms.get(pin).size === 0) {
+              rooms.delete(pin);
+              if (roomThemes.has(pin)) {
+                roomThemes.delete(pin);
+              }
+              console.log(`Room ${pin} cleared (no users)`);
+            }
+          }, 30000); // Wait 30 seconds before clearing empty room
+        } else {
+          // Notify others that user left
+          socket.to(pin).emit('user_left', { 
+            message: 'A user left the chat',
+            userName: socket.userName
+          });
+        }
       }
-      if (roomThemes.has(pin)) {
-        roomThemes.delete(pin);
-      }
-      console.log(`Room ${pin} deleted`);
-    }, 5000);
+      
+      socket.leave(pin);
+      socket.room = null;
+    }
   });
 
   socket.on('disconnect', () => {
@@ -132,6 +193,9 @@ io.on('connection', (socket) => {
       // Remove user from room
       if (rooms.has(socket.room)) {
         rooms.get(socket.room).delete(socket.id);
+        
+        // Update user count
+        io.to(socket.room).emit('user_count_update', { count: rooms.get(socket.room).size });
         
         // If room is empty, delete it after a delay
         if (rooms.get(socket.room).size === 0) {
