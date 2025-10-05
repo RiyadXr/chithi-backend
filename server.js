@@ -93,19 +93,82 @@ async function loadDataFromJSONBin() {
   }
 }
 
-// Save data to JSONBin
-async function saveDataToJSONBin() {
+// Enhanced function to save comprehensive data to JSONBin
+async function saveComprehensiveDataToJSONBin() {
   try {
+    // Get current timestamp
+    const currentTime = new Date().toISOString();
+    
     // Convert Maps to objects for JSON serialization
-    const dataToSave = {
-      rooms: Object.fromEntries(
-        Array.from(rooms.entries()).map(([pin, users]) => [pin, Array.from(users)])
+    const activeRoomsData = Object.fromEntries(
+      Array.from(rooms.entries()).map(([pin, users]) => [pin, Array.from(users)])
+    );
+    
+    const activeUsersData = Object.fromEntries(roomUsers.entries());
+    const activeChatHistory = Object.fromEntries(chatHistory.entries());
+    const activeMessageReactions = Object.fromEntries(messageReactions.entries());
+    const activeRoomThemes = Object.fromEntries(roomThemes.entries());
+
+    // First, load existing data to preserve deleted room information
+    let existingData = {};
+    try {
+      const response = await fetch(JSONBIN_URL, {
+        method: 'GET',
+        headers: {
+          'X-Master-Key': JSONBIN_API_KEY,
+          'Content-Type': 'application/json'
+        }
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        existingData = data.record || {};
+      }
+    } catch (error) {
+      console.error('Error loading existing data:', error);
+    }
+
+    // Prepare comprehensive data structure
+    const comprehensiveData = {
+      // Active data (current state)
+      activeRooms: activeRoomsData,
+      activeUsers: activeUsersData,
+      activeChatHistory: activeChatHistory,
+      activeMessageReactions: activeMessageReactions,
+      activeRoomThemes: activeRoomThemes,
+      
+      // Archive data (preserve deleted rooms)
+      archivedRooms: {
+        ...(existingData.archivedRooms || {}),
+        ...activeChatHistory
+      },
+      
+      // User activity log
+      userActivity: [
+        ...(existingData.userActivity || []),
+        {
+          timestamp: currentTime,
+          activeUsers: Object.values(activeUsersData).flat().length,
+          activeRooms: Object.keys(activeRoomsData).length,
+          totalMessages: Object.values(activeChatHistory).flat().length
+        }
+      ].slice(-1000), // Keep last 1000 activity records
+      
+      // Room statistics
+      roomStatistics: Object.fromEntries(
+        Object.entries(activeChatHistory).map(([pin, messages]) => [
+          pin,
+          {
+            messageCount: messages.length,
+            lastActivity: messages.length > 0 ? messages[messages.length - 1].timestamp : currentTime,
+            users: activeUsersData[pin] || [],
+            theme: activeRoomThemes[pin] || 'default'
+          }
+        ])
       ),
-      users: Object.fromEntries(roomUsers.entries()),
-      chatHistory: Object.fromEntries(chatHistory.entries()),
-      messageReactions: Object.fromEntries(messageReactions.entries()),
-      roomThemes: Object.fromEntries(roomThemes.entries()),
-      lastUpdated: new Date().toISOString()
+      
+      lastUpdated: currentTime,
+      serverStartTime: existingData.serverStartTime || currentTime
     };
 
     const response = await fetch(JSONBIN_URL, {
@@ -114,7 +177,7 @@ async function saveDataToJSONBin() {
         'X-Master-Key': JSONBIN_API_KEY,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify(dataToSave)
+      body: JSON.stringify(comprehensiveData)
     });
 
     if (!response.ok) {
@@ -122,10 +185,10 @@ async function saveDataToJSONBin() {
     }
 
     const result = await response.json();
-    console.log('Data saved to JSONBin successfully');
+    console.log('Comprehensive data saved to JSONBin successfully');
     return result;
   } catch (error) {
-    console.error('Error saving data to JSONBin:', error);
+    console.error('Error saving comprehensive data to JSONBin:', error);
     throw error;
   }
 }
@@ -137,8 +200,77 @@ function scheduleSave() {
     clearTimeout(saveTimeout);
   }
   saveTimeout = setTimeout(() => {
-    saveDataToJSONBin().catch(console.error);
-  }, 2000); // Save after 2 seconds of inactivity
+    saveComprehensiveDataToJSONBin().catch(console.error);
+  }, 3000); // Save after 3 seconds of inactivity
+}
+
+// Function to archive room data before deletion
+async function archiveRoomData(pin) {
+  try {
+    // Load existing data
+    const response = await fetch(JSONBIN_URL, {
+      method: 'GET',
+      headers: {
+        'X-Master-Key': JSONBIN_API_KEY,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if (!response.ok) return;
+
+    const data = await response.json();
+    const existingData = data.record || {};
+
+    // Prepare archived room data
+    const roomArchive = {
+      pin: pin,
+      roomUsers: roomUsers.get(pin) || [],
+      chatHistory: chatHistory.get(pin) || [],
+      messageReactions: Array.from(messageReactions.entries())
+        .filter(([key]) => key.startsWith(`${pin}-`))
+        .reduce((acc, [key, value]) => {
+          acc[key] = value;
+          return acc;
+        }, {}),
+      theme: roomThemes.get(pin) || 'default',
+      deletedAt: new Date().toISOString(),
+      messageCount: chatHistory.get(pin)?.length || 0,
+      userCount: roomUsers.get(pin)?.length || 0
+    };
+
+    // Update existing data with archive
+    const updatedData = {
+      ...existingData,
+      archivedRooms: {
+        ...(existingData.archivedRooms || {}),
+        [pin]: roomArchive
+      },
+      deletionLog: [
+        ...(existingData.deletionLog || []),
+        {
+          pin: pin,
+          deletedAt: new Date().toISOString(),
+          reason: 'user_deletion',
+          finalMessageCount: chatHistory.get(pin)?.length || 0,
+          finalUserCount: roomUsers.get(pin)?.length || 0
+        }
+      ].slice(-100) // Keep last 100 deletion logs
+    };
+
+    // Save archived data
+    await fetch(JSONBIN_URL, {
+      method: 'PUT',
+      headers: {
+        'X-Master-Key': JSONBIN_API_KEY,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(updatedData)
+    });
+
+    console.log(`Room ${pin} data archived successfully`);
+  } catch (error) {
+    console.error('Error archiving room data:', error);
+  }
 }
 
 io.on('connection', (socket) => {
@@ -171,9 +303,14 @@ io.on('connection', (socket) => {
     // Check if user already exists in room
     const existingUserIndex = roomUsers.get(pin).findIndex(user => user.socketId === socket.id);
     if (existingUserIndex === -1) {
-      roomUsers.get(pin).push({ socketId: socket.id, userName: userName });
+      roomUsers.get(pin).push({ 
+        socketId: socket.id, 
+        userName: userName,
+        joinedAt: new Date().toISOString()
+      });
     } else {
       roomUsers.get(pin)[existingUserIndex].userName = userName;
+      roomUsers.get(pin)[existingUserIndex].lastActive = new Date().toISOString();
     }
     
     // Send current theme if exists
@@ -242,7 +379,14 @@ io.on('connection', (socket) => {
     }
     
     const messageData = {
-      message, sender, timestamp, messageId, type: 'received', replyTo
+      message, 
+      sender, 
+      timestamp, 
+      messageId, 
+      type: 'received', 
+      replyTo,
+      sentAt: new Date().toISOString(),
+      pin: pin
     };
     
     chatHistory.get(pin).push(messageData);
@@ -368,10 +512,13 @@ io.on('connection', (socket) => {
     scheduleSave();
   });
 
-  socket.on('delete_room', (data) => {
+  socket.on('delete_room', async (data) => {
     const { pin } = data;
     
-    // Clear room data
+    // Archive room data before deletion
+    await archiveRoomData(pin);
+    
+    // Clear room data from active memory
     if (rooms.has(pin)) {
       rooms.delete(pin);
     }
@@ -393,10 +540,10 @@ io.on('connection', (socket) => {
     // Notify all users in the room
     io.to(pin).emit('room_deleted');
     
-    // Schedule save to JSONBin
+    // Final save to update active data
     scheduleSave();
     
-    console.log(`Room ${pin} deleted`);
+    console.log(`Room ${pin} deleted and archived`);
   });
 
   socket.on('leave_room', (data) => {
@@ -508,6 +655,7 @@ loadDataFromJSONBin().then(() => {
   const PORT = process.env.PORT || 3000;
   server.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
+    console.log('JSONBin persistence is active - all data will be saved including deleted rooms');
   });
 }).catch(error => {
   console.error('Failed to load data from JSONBin, starting server anyway:', error);
@@ -516,3 +664,8 @@ loadDataFromJSONBin().then(() => {
     console.log(`Server running on port ${PORT}`);
   });
 });
+
+// Save data periodically (every 5 minutes) as backup
+setInterval(() => {
+  saveComprehensiveDataToJSONBin().catch(console.error);
+}, 5 * 60 * 1000);
