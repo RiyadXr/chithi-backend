@@ -1,7 +1,7 @@
 {
   "name": "chithi-backend",
   "version": "1.0.0",
-  "description": "Backend for Chithi chat app",
+  "description": "Backend for Chithi chat app with JSONBin persistence",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
