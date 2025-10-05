@@ -6,7 +6,7 @@ const fetch = require('node-fetch');
 
 const app = express();
 app.use(cors());
-app.use(express.json()); // Add this to parse JSON bodies
+app.use(express.json());
 
 const server = http.createServer(app);
 const io = socketIo(server, {
@@ -16,9 +16,9 @@ const io = socketIo(server, {
   }
 });
 
-// JSONBin configuration
-const JSONBIN_API_KEY = '$2a$10$nCvtrBD0oAjmgXA5JAjTJ.3O5cDYYn7t7QpgqevUchxQTb5V4mBOO'; // Replace with your actual API key
-const JSONBIN_BIN_ID = '68e223bc43b1c97be95ad96d'; // Replace with your actual bin ID
+// JSONBin configuration - USING YOUR CREDENTIALS
+const JSONBIN_API_KEY = '$2a$10$nCvtrBD0oAjmgXA5JAjTJ.3O5cDYYn7t7QpgqevUchxQTb5V4mBOO';
+const JSONBIN_BIN_ID = '68e223bc43b1c97be95ad96d';
 const JSONBIN_URL = `https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}`;
 const JSONBIN_HEADERS = {
   'Content-Type': 'application/json',
@@ -31,6 +31,8 @@ const initialData = {
   rooms: {},
   users: {},
   chatHistory: {},
+  messageReactions: {},
+  roomThemes: {},
   lastUpdated: new Date().toISOString()
 };
 
@@ -45,6 +47,7 @@ const messageStatus = new Map();
 // JSONBin Utility Functions
 async function loadFromJSONBin() {
   try {
+    console.log('Loading data from JSONBin...');
     const response = await fetch(JSONBIN_URL, {
       method: 'GET',
       headers: JSONBIN_HEADERS
@@ -56,7 +59,7 @@ async function loadFromJSONBin() {
     }
     
     const data = await response.json();
-    console.log('Data loaded from JSONBin');
+    console.log('Data successfully loaded from JSONBin');
     return data.record || initialData;
   } catch (error) {
     console.error('Error loading from JSONBin:', error);
@@ -82,7 +85,7 @@ async function saveToJSONBin(data) {
     }
 
     const result = await response.json();
-    console.log('Data saved to JSONBin');
+    console.log('Data successfully saved to JSONBin');
     return result;
   } catch (error) {
     console.error('Error saving to JSONBin:', error);
@@ -113,6 +116,16 @@ loadFromJSONBin().then(data => {
       chatHistory.set(pin, jsonBinData.chatHistory[pin]);
     });
   }
+
+  if (jsonBinData.messageReactions) {
+    Object.keys(jsonBinData.messageReactions).forEach(reactionKey => {
+      messageReactions.set(reactionKey, jsonBinData.messageReactions[reactionKey]);
+    });
+  }
+
+  console.log(`Loaded ${Object.keys(jsonBinData.rooms).length} rooms from JSONBin`);
+  console.log(`Loaded ${Object.keys(jsonBinData.users).length} users from JSONBin`);
+  console.log(`Loaded ${Object.keys(jsonBinData.chatHistory).length} chat histories from JSONBin`);
 });
 
 // Socket.io connection handling
@@ -149,12 +162,15 @@ io.on('connection', (socket) => {
       jsonBinData.users[userName] = {
         joinedAt: new Date().toISOString(),
         lastActive: new Date().toISOString(),
-        roomsJoined: []
+        roomsJoined: [],
+        socketId: socket.id
       };
+    } else {
+      jsonBinData.users[userName].lastActive = new Date().toISOString();
+      jsonBinData.users[userName].socketId = socket.id;
     }
     
     // Update user activity and rooms
-    jsonBinData.users[userName].lastActive = new Date().toISOString();
     if (!jsonBinData.users[userName].roomsJoined.includes(pin)) {
       jsonBinData.users[userName].roomsJoined.push(pin);
     }
@@ -164,18 +180,22 @@ io.on('connection', (socket) => {
       jsonBinData.rooms[pin] = {
         createdAt: new Date().toISOString(),
         createdBy: userName,
-        userCount: 0,
-        theme: 'default'
+        userCount: 1,
+        theme: 'default',
+        lastActive: new Date().toISOString()
       };
+    } else {
+      // Update room user count
+      jsonBinData.rooms[pin].userCount = rooms.get(pin).size;
+      jsonBinData.rooms[pin].lastActive = new Date().toISOString();
     }
-    
-    // Update room user count
-    jsonBinData.rooms[pin].userCount = rooms.get(pin).size;
-    jsonBinData.rooms[pin].lastActive = new Date().toISOString();
     
     // Send current theme if exists
     if (roomThemes.has(pin)) {
       socket.emit('theme_changed', { theme: roomThemes.get(pin) });
+    } else if (jsonBinData.roomThemes && jsonBinData.roomThemes[pin]) {
+      roomThemes.set(pin, jsonBinData.roomThemes[pin]);
+      socket.emit('theme_changed', { theme: jsonBinData.roomThemes[pin] });
     }
     
     // Send user count update
@@ -187,11 +207,14 @@ io.on('connection', (socket) => {
     // Send chat history if exists
     if (chatHistory.has(pin)) {
       socket.emit('chat_history', { messages: chatHistory.get(pin) });
+    } else if (jsonBinData.chatHistory && jsonBinData.chatHistory[pin]) {
+      chatHistory.set(pin, jsonBinData.chatHistory[pin]);
+      socket.emit('chat_history', { messages: jsonBinData.chatHistory[pin] });
     }
     
     // Notify others in the room
     socket.to(pin).emit('user_joined', { 
-      message: 'A user joined the chat',
+      message: `${userName} joined the chat`,
       userName: userName
     });
 
@@ -241,7 +264,13 @@ io.on('connection', (socket) => {
     }
     
     const messageData = {
-      message, sender, timestamp, messageId, type: 'received', replyTo
+      message, 
+      sender, 
+      timestamp, 
+      messageId, 
+      type: 'received', 
+      replyTo,
+      sentAt: new Date().toISOString()
     };
     
     chatHistory.get(pin).push(messageData);
@@ -256,13 +285,7 @@ io.on('connection', (socket) => {
       jsonBinData.chatHistory[pin] = [];
     }
     
-    const jsonBinMessageData = {
-      ...messageData,
-      roomPin: pin,
-      sentAt: new Date().toISOString()
-    };
-    
-    jsonBinData.chatHistory[pin].push(jsonBinMessageData);
+    jsonBinData.chatHistory[pin].push(messageData);
     
     // Keep only last 200 messages in JSONBin to prevent excessive storage
     if (jsonBinData.chatHistory[pin].length > 200) {
@@ -346,7 +369,8 @@ io.on('connection', (socket) => {
     // Broadcast reaction to room
     io.to(pin).emit('message_reaction', {
       messageId: messageId,
-      reaction: reaction
+      reaction: reaction,
+      count: jsonBinData.messageReactions[reactionKey][reaction]
     });
     
     // Save to JSONBin
@@ -375,6 +399,15 @@ io.on('connection', (socket) => {
     // Remove message status
     if (messageStatus.has(messageId)) {
       messageStatus.delete(messageId);
+    }
+    
+    // Remove reactions for this message
+    const reactionKey = `${pin}-${messageId}`;
+    if (messageReactions.has(reactionKey)) {
+      messageReactions.delete(reactionKey);
+    }
+    if (jsonBinData.messageReactions && jsonBinData.messageReactions[reactionKey]) {
+      delete jsonBinData.messageReactions[reactionKey];
     }
     
     // Broadcast unsend to all users in the room
@@ -409,6 +442,11 @@ io.on('connection', (socket) => {
     roomThemes.set(pin, theme);
     
     // Store theme in JSONBin
+    if (!jsonBinData.roomThemes) {
+      jsonBinData.roomThemes = {};
+    }
+    jsonBinData.roomThemes[pin] = theme;
+    
     if (jsonBinData.rooms[pin]) {
       jsonBinData.rooms[pin].theme = theme;
     }
@@ -447,6 +485,9 @@ io.on('connection', (socket) => {
     }
     if (jsonBinData.chatHistory[pin]) {
       delete jsonBinData.chatHistory[pin];
+    }
+    if (jsonBinData.roomThemes && jsonBinData.roomThemes[pin]) {
+      delete jsonBinData.roomThemes[pin];
     }
     
     // Clear message status for this room
@@ -489,6 +530,7 @@ io.on('connection', (socket) => {
         // Update JSONBin room user count
         if (jsonBinData.rooms[pin]) {
           jsonBinData.rooms[pin].userCount = rooms.get(pin).size;
+          jsonBinData.rooms[pin].lastActive = new Date().toISOString();
         }
         
         // If room is empty, delete it after a delay
@@ -508,7 +550,7 @@ io.on('connection', (socket) => {
         } else {
           // Notify others that user left
           socket.to(pin).emit('user_left', { 
-            message: 'A user left the chat',
+            message: `${socket.userName} left the chat`,
             userName: socket.userName
           });
         }
@@ -548,6 +590,7 @@ io.on('connection', (socket) => {
         // Update JSONBin room user count
         if (jsonBinData.rooms[socket.room]) {
           jsonBinData.rooms[socket.room].userCount = rooms.get(socket.room).size;
+          jsonBinData.rooms[socket.room].lastActive = new Date().toISOString();
         }
         
         // If room is empty, delete it after a delay
@@ -567,7 +610,7 @@ io.on('connection', (socket) => {
         } else {
           // Notify others that user left
           socket.to(socket.room).emit('user_left', { 
-            message: 'A user left the chat',
+            message: `${socket.userName} left the chat`,
             userName: socket.userName
           });
         }
@@ -591,6 +634,7 @@ app.get('/api/stats', async (req, res) => {
       totalUsers: Object.keys(jsonBinData.users).length,
       totalMessages: Object.keys(jsonBinData.chatHistory).reduce((acc, pin) => 
         acc + (jsonBinData.chatHistory[pin]?.length || 0), 0),
+      activeRooms: rooms.size,
       lastUpdated: jsonBinData.lastUpdated
     };
     
@@ -611,8 +655,34 @@ app.get('/api/room/:pin/history', async (req, res) => {
   }
 });
 
+// API endpoint to get all rooms
+app.get('/api/rooms', async (req, res) => {
+  try {
+    const roomsList = Object.keys(jsonBinData.rooms).map(pin => ({
+      pin,
+      ...jsonBinData.rooms[pin]
+    }));
+    
+    res.json({ rooms: roomsList });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to get rooms list' });
+  }
+});
+
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    status: 'OK', 
+    timestamp: new Date().toISOString(),
+    jsonBinStatus: 'Connected',
+    activeConnections: io.engine.clientsCount
+  });
+});
+
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-  console.log(`JSONBin integration enabled`);
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📊 JSONBin integration enabled`);
+  console.log(`🔑 Bin ID: ${JSONBIN_BIN_ID}`);
+  console.log(`🌐 Health check: http://localhost:${PORT}/api/health`);
 });
