@@ -2,9 +2,12 @@ const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
+const fetch = require('node-fetch');
 
 const app = express();
 app.use(cors());
+app.use(express.json()); // Add this to parse JSON bodies
+
 const server = http.createServer(app);
 const io = socketIo(server, {
   cors: {
@@ -13,23 +16,110 @@ const io = socketIo(server, {
   }
 });
 
-// Store active rooms and their users
+// JSONBin configuration
+const JSONBIN_API_KEY = '$2a$10$nCvtrBD0oAjmgXA5JAjTJ.3O5cDYYn7t7QpgqevUchxQTb5V4mBOO'; // Replace with your actual API key
+const JSONBIN_BIN_ID = '68e223bc43b1c97be95ad96d'; // Replace with your actual bin ID
+const JSONBIN_URL = `https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}`;
+const JSONBIN_HEADERS = {
+  'Content-Type': 'application/json',
+  'X-Master-Key': JSONBIN_API_KEY,
+  'X-Bin-Versioning': 'false'
+};
+
+// Initial data structure for JSONBin
+const initialData = {
+  rooms: {},
+  users: {},
+  chatHistory: {},
+  lastUpdated: new Date().toISOString()
+};
+
+// Store active rooms and their users (in-memory for real-time operations)
 const rooms = new Map();
-// Store message reactions
 const messageReactions = new Map();
-// Store room themes
 const roomThemes = new Map();
-// Store chat history
 const chatHistory = new Map();
-// Store room users with names
 const roomUsers = new Map();
-// Store message status (sent, delivered, seen)
 const messageStatus = new Map();
 
+// JSONBin Utility Functions
+async function loadFromJSONBin() {
+  try {
+    const response = await fetch(JSONBIN_URL, {
+      method: 'GET',
+      headers: JSONBIN_HEADERS
+    });
+    
+    if (!response.ok) {
+      console.log('No existing data found in JSONBin, starting fresh...');
+      return initialData;
+    }
+    
+    const data = await response.json();
+    console.log('Data loaded from JSONBin');
+    return data.record || initialData;
+  } catch (error) {
+    console.error('Error loading from JSONBin:', error);
+    return initialData;
+  }
+}
+
+async function saveToJSONBin(data) {
+  try {
+    const updateData = {
+      ...data,
+      lastUpdated: new Date().toISOString()
+    };
+
+    const response = await fetch(JSONBIN_URL, {
+      method: 'PUT',
+      headers: JSONBIN_HEADERS,
+      body: JSON.stringify(updateData)
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const result = await response.json();
+    console.log('Data saved to JSONBin');
+    return result;
+  } catch (error) {
+    console.error('Error saving to JSONBin:', error);
+    throw error;
+  }
+}
+
+// Initialize JSONBin data
+let jsonBinData = initialData;
+
+// Load data on server start
+loadFromJSONBin().then(data => {
+  jsonBinData = data;
+  console.log('Server data initialized from JSONBin');
+  
+  // Load existing rooms and chat history into memory
+  if (jsonBinData.rooms) {
+    Object.keys(jsonBinData.rooms).forEach(pin => {
+      const room = jsonBinData.rooms[pin];
+      if (room.theme) {
+        roomThemes.set(pin, room.theme);
+      }
+    });
+  }
+  
+  if (jsonBinData.chatHistory) {
+    Object.keys(jsonBinData.chatHistory).forEach(pin => {
+      chatHistory.set(pin, jsonBinData.chatHistory[pin]);
+    });
+  }
+});
+
+// Socket.io connection handling
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
-  socket.on('join_room', (data) => {
+  socket.on('join_room', async (data) => {
     const { pin, userName } = data;
     
     // Leave any previous rooms
@@ -53,6 +143,35 @@ io.on('connection', (socket) => {
       roomUsers.set(pin, []);
     }
     roomUsers.get(pin).push({ socketId: socket.id, userName: userName });
+    
+    // Save user to JSONBin
+    if (!jsonBinData.users[userName]) {
+      jsonBinData.users[userName] = {
+        joinedAt: new Date().toISOString(),
+        lastActive: new Date().toISOString(),
+        roomsJoined: []
+      };
+    }
+    
+    // Update user activity and rooms
+    jsonBinData.users[userName].lastActive = new Date().toISOString();
+    if (!jsonBinData.users[userName].roomsJoined.includes(pin)) {
+      jsonBinData.users[userName].roomsJoined.push(pin);
+    }
+    
+    // Save room to JSONBin
+    if (!jsonBinData.rooms[pin]) {
+      jsonBinData.rooms[pin] = {
+        createdAt: new Date().toISOString(),
+        createdBy: userName,
+        userCount: 0,
+        theme: 'default'
+      };
+    }
+    
+    // Update room user count
+    jsonBinData.rooms[pin].userCount = rooms.get(pin).size;
+    jsonBinData.rooms[pin].lastActive = new Date().toISOString();
     
     // Send current theme if exists
     if (roomThemes.has(pin)) {
@@ -80,13 +199,11 @@ io.on('connection', (socket) => {
     if (chatHistory.has(pin)) {
       chatHistory.get(pin).forEach(message => {
         if (message.type === 'received') {
-          // Update status to delivered for all received messages
           if (!messageStatus.has(message.messageId)) {
             messageStatus.set(message.messageId, {});
           }
           messageStatus.get(message.messageId).delivered = true;
           
-          // Notify sender about delivery
           const sender = roomUsers.get(pin).find(user => user.userName === message.sender);
           if (sender) {
             io.to(sender.socketId).emit('message_status_update', {
@@ -96,6 +213,13 @@ io.on('connection', (socket) => {
           }
         }
       });
+    }
+    
+    // Save to JSONBin
+    try {
+      await saveToJSONBin(jsonBinData);
+    } catch (error) {
+      console.error('Failed to save to JSONBin:', error);
     }
     
     console.log(`User ${socket.id} (${userName}) joined room ${pin}`);
@@ -108,10 +232,10 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('send_message', (data) => {
+  socket.on('send_message', async (data) => {
     const { pin, message, timestamp, messageId, sender, replyTo } = data;
     
-    // Store message in history
+    // Store message in memory
     if (!chatHistory.has(pin)) {
       chatHistory.set(pin, []);
     }
@@ -122,9 +246,27 @@ io.on('connection', (socket) => {
     
     chatHistory.get(pin).push(messageData);
     
-    // Keep only last 100 messages
+    // Keep only last 100 messages in memory
     if (chatHistory.get(pin).length > 100) {
       chatHistory.set(pin, chatHistory.get(pin).slice(-100));
+    }
+
+    // Store message in JSONBin
+    if (!jsonBinData.chatHistory[pin]) {
+      jsonBinData.chatHistory[pin] = [];
+    }
+    
+    const jsonBinMessageData = {
+      ...messageData,
+      roomPin: pin,
+      sentAt: new Date().toISOString()
+    };
+    
+    jsonBinData.chatHistory[pin].push(jsonBinMessageData);
+    
+    // Keep only last 200 messages in JSONBin to prevent excessive storage
+    if (jsonBinData.chatHistory[pin].length > 200) {
+      jsonBinData.chatHistory[pin] = jsonBinData.chatHistory[pin].slice(-200);
     }
 
     // Initialize status for this message
@@ -149,6 +291,13 @@ io.on('connection', (socket) => {
         status: 'delivered'
       });
     }
+    
+    // Save to JSONBin
+    try {
+      await saveToJSONBin(jsonBinData);
+    } catch (error) {
+      console.error('Failed to save message to JSONBin:', error);
+    }
   });
 
   socket.on('message_delivered', (data) => {
@@ -157,7 +306,6 @@ io.on('connection', (socket) => {
     if (messageStatus.has(messageId)) {
       messageStatus.get(messageId).delivered = true;
       
-      // Notify sender about delivery
       const message = chatHistory.get(pin)?.find(msg => msg.messageId === messageId);
       if (message) {
         const sender = roomUsers.get(pin)?.find(user => user.userName === message.sender);
@@ -171,10 +319,10 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('message_reaction', (data) => {
+  socket.on('message_reaction', async (data) => {
     const { pin, messageId, reaction } = data;
     
-    // Store reaction
+    // Store reaction in memory
     const reactionKey = `${pin}-${messageId}`;
     if (!messageReactions.has(reactionKey)) {
       messageReactions.set(reactionKey, {});
@@ -183,19 +331,45 @@ io.on('connection', (socket) => {
     const reactions = messageReactions.get(reactionKey);
     reactions[reaction] = (reactions[reaction] || 0) + 1;
     
+    // Store reaction in JSONBin
+    if (!jsonBinData.messageReactions) {
+      jsonBinData.messageReactions = {};
+    }
+    
+    if (!jsonBinData.messageReactions[reactionKey]) {
+      jsonBinData.messageReactions[reactionKey] = {};
+    }
+    
+    jsonBinData.messageReactions[reactionKey][reaction] = 
+      (jsonBinData.messageReactions[reactionKey][reaction] || 0) + 1;
+    
     // Broadcast reaction to room
     io.to(pin).emit('message_reaction', {
       messageId: messageId,
       reaction: reaction
     });
+    
+    // Save to JSONBin
+    try {
+      await saveToJSONBin(jsonBinData);
+    } catch (error) {
+      console.error('Failed to save reaction to JSONBin:', error);
+    }
   });
 
-  socket.on('unsend_message', (data) => {
+  socket.on('unsend_message', async (data) => {
     const { pin, messageId } = data;
     
-    // Remove message from history
+    // Remove message from memory
     if (chatHistory.has(pin)) {
       chatHistory.set(pin, chatHistory.get(pin).filter(msg => msg.messageId !== messageId));
+    }
+    
+    // Remove message from JSONBin
+    if (jsonBinData.chatHistory[pin]) {
+      jsonBinData.chatHistory[pin] = jsonBinData.chatHistory[pin].filter(
+        msg => msg.messageId !== messageId
+      );
     }
     
     // Remove message status
@@ -207,6 +381,13 @@ io.on('connection', (socket) => {
     io.to(pin).emit('message_unsent', {
       messageId: messageId
     });
+    
+    // Save to JSONBin
+    try {
+      await saveToJSONBin(jsonBinData);
+    } catch (error) {
+      console.error('Failed to save unsend action to JSONBin:', error);
+    }
     
     console.log(`Message ${messageId} unsent in room ${pin}`);
   });
@@ -221,20 +402,32 @@ io.on('connection', (socket) => {
     socket.to(pin).emit('typing_stop');
   });
 
-  socket.on('change_theme', (data) => {
+  socket.on('change_theme', async (data) => {
     const { pin, theme } = data;
     
-    // Store theme for the room
+    // Store theme in memory
     roomThemes.set(pin, theme);
+    
+    // Store theme in JSONBin
+    if (jsonBinData.rooms[pin]) {
+      jsonBinData.rooms[pin].theme = theme;
+    }
     
     // Broadcast theme change to all users in the room
     io.to(pin).emit('theme_changed', { theme: theme });
+    
+    // Save to JSONBin
+    try {
+      await saveToJSONBin(jsonBinData);
+    } catch (error) {
+      console.error('Failed to save theme to JSONBin:', error);
+    }
   });
 
-  socket.on('delete_room', (data) => {
+  socket.on('delete_room', async (data) => {
     const { pin } = data;
     
-    // Clear room data
+    // Clear room data from memory
     if (rooms.has(pin)) {
       rooms.delete(pin);
     }
@@ -248,6 +441,14 @@ io.on('connection', (socket) => {
       roomUsers.delete(pin);
     }
     
+    // Clear room data from JSONBin
+    if (jsonBinData.rooms[pin]) {
+      delete jsonBinData.rooms[pin];
+    }
+    if (jsonBinData.chatHistory[pin]) {
+      delete jsonBinData.chatHistory[pin];
+    }
+    
     // Clear message status for this room
     Array.from(messageStatus.keys()).forEach(messageId => {
       messageStatus.delete(messageId);
@@ -256,10 +457,17 @@ io.on('connection', (socket) => {
     // Notify all users in the room
     io.to(pin).emit('room_deleted');
     
+    // Save to JSONBin
+    try {
+      await saveToJSONBin(jsonBinData);
+    } catch (error) {
+      console.error('Failed to save room deletion to JSONBin:', error);
+    }
+    
     console.log(`Room ${pin} deleted`);
   });
 
-  socket.on('leave_room', (data) => {
+  socket.on('leave_room', async (data) => {
     const { pin } = data;
     
     if (socket.room === pin) {
@@ -278,6 +486,11 @@ io.on('connection', (socket) => {
         // Update user count
         io.to(pin).emit('user_count_update', { count: rooms.get(pin).size });
         
+        // Update JSONBin room user count
+        if (jsonBinData.rooms[pin]) {
+          jsonBinData.rooms[pin].userCount = rooms.get(pin).size;
+        }
+        
         // If room is empty, delete it after a delay
         if (rooms.get(pin).size === 0) {
           setTimeout(() => {
@@ -291,7 +504,7 @@ io.on('connection', (socket) => {
               }
               console.log(`Room ${pin} cleared (no users)`);
             }
-          }, 30000); // Wait 30 seconds before clearing empty room
+          }, 30000);
         } else {
           // Notify others that user left
           socket.to(pin).emit('user_left', { 
@@ -303,10 +516,17 @@ io.on('connection', (socket) => {
       
       socket.leave(pin);
       socket.room = null;
+      
+      // Save to JSONBin
+      try {
+        await saveToJSONBin(jsonBinData);
+      } catch (error) {
+        console.error('Failed to save leave room to JSONBin:', error);
+      }
     }
   });
 
-  socket.on('disconnect', () => {
+  socket.on('disconnect', async () => {
     console.log('User disconnected:', socket.id);
     
     if (socket.room) {
@@ -325,6 +545,11 @@ io.on('connection', (socket) => {
         // Update user count
         io.to(socket.room).emit('user_count_update', { count: rooms.get(socket.room).size });
         
+        // Update JSONBin room user count
+        if (jsonBinData.rooms[socket.room]) {
+          jsonBinData.rooms[socket.room].userCount = rooms.get(socket.room).size;
+        }
+        
         // If room is empty, delete it after a delay
         if (rooms.get(socket.room).size === 0) {
           setTimeout(() => {
@@ -338,7 +563,7 @@ io.on('connection', (socket) => {
               }
               console.log(`Room ${socket.room} cleared (no users)`);
             }
-          }, 30000); // Wait 30 seconds before clearing empty room
+          }, 30000);
         } else {
           // Notify others that user left
           socket.to(socket.room).emit('user_left', { 
@@ -347,11 +572,47 @@ io.on('connection', (socket) => {
           });
         }
       }
+      
+      // Save to JSONBin
+      try {
+        await saveToJSONBin(jsonBinData);
+      } catch (error) {
+        console.error('Failed to save disconnect to JSONBin:', error);
+      }
     }
   });
+});
+
+// API endpoint to get statistics
+app.get('/api/stats', async (req, res) => {
+  try {
+    const stats = {
+      totalRooms: Object.keys(jsonBinData.rooms).length,
+      totalUsers: Object.keys(jsonBinData.users).length,
+      totalMessages: Object.keys(jsonBinData.chatHistory).reduce((acc, pin) => 
+        acc + (jsonBinData.chatHistory[pin]?.length || 0), 0),
+      lastUpdated: jsonBinData.lastUpdated
+    };
+    
+    res.json(stats);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to get statistics' });
+  }
+});
+
+// API endpoint to get room history
+app.get('/api/room/:pin/history', async (req, res) => {
+  try {
+    const { pin } = req.params;
+    const history = jsonBinData.chatHistory[pin] || [];
+    res.json({ pin, messages: history });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to get room history' });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`JSONBin integration enabled`);
 });
