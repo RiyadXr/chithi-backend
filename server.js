@@ -98,7 +98,7 @@ io.on('connection', (socket) => {
       });
     }
     
-    console.log(User ${socket.id} (${userName}) joined room ${pin});
+    console.log(`User ${socket.id} (${userName}) joined room ${pin}`);
   });
 
   socket.on('get_current_users', (data) => {
@@ -175,7 +175,7 @@ io.on('connection', (socket) => {
     const { pin, messageId, reaction } = data;
     
     // Store reaction
-    const reactionKey = ${pin}-${messageId};
+    const reactionKey = `${pin}-${messageId}`;
     if (!messageReactions.has(reactionKey)) {
       messageReactions.set(reactionKey, {});
     }
@@ -208,7 +208,7 @@ io.on('connection', (socket) => {
       messageId: messageId
     });
     
-    console.log(Message ${messageId} unsent in room ${pin});
+    console.log(`Message ${messageId} unsent in room ${pin}`);
   });
 
   socket.on('typing_start', (data) => {
@@ -256,7 +256,7 @@ io.on('connection', (socket) => {
     // Notify all users in the room
     io.to(pin).emit('room_deleted');
     
-    console.log(Room ${pin} deleted);
+    console.log(`Room ${pin} deleted`);
   });
 
   socket.on('leave_room', (data) => {
@@ -289,7 +289,7 @@ io.on('connection', (socket) => {
               if (roomUsers.has(pin)) {
                 roomUsers.delete(pin);
               }
-              console.log(Room ${pin} cleared (no users));
+              console.log(`Room ${pin} cleared (no users)`);
             }
           }, 30000); // Wait 30 seconds before clearing empty room
         } else {
@@ -336,7 +336,7 @@ io.on('connection', (socket) => {
               if (roomUsers.has(socket.room)) {
                 roomUsers.delete(socket.room);
               }
-              console.log(Room ${socket.room} cleared (no users));
+              console.log(`Room ${socket.room} cleared (no users)`);
             }
           }, 30000); // Wait 30 seconds before clearing empty room
         } else {
@@ -353,5 +353,5 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(Server running on port ${PORT});
+  console.log(`Server running on port ${PORT}`);
 });
