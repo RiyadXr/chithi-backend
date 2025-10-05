@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
+const fetch = require('node-fetch');
 
 const app = express();
 app.use(cors());
@@ -12,6 +13,11 @@ const io = socketIo(server, {
     methods: ["GET", "POST"]
   }
 });
+
+// JSONBin configuration
+const JSONBIN_BIN_ID = "68e223bc43b1c97be95ad96d";
+const JSONBIN_API_KEY = "$2a$10$nCvtrBD0oAjmgXA5JAjTJ.3O5cDYYn7t7QpgqevUchxQTb5V4mBOO";
+const JSONBIN_URL = `https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}`;
 
 // Store active rooms and their users
 const rooms = new Map();
@@ -25,6 +31,115 @@ const chatHistory = new Map();
 const roomUsers = new Map();
 // Store message status (sent, delivered, seen)
 const messageStatus = new Map();
+
+// Load data from JSONBin on server start
+async function loadDataFromJSONBin() {
+  try {
+    console.log('Loading data from JSONBin...');
+    const response = await fetch(JSONBIN_URL, {
+      method: 'GET',
+      headers: {
+        'X-Master-Key': JSONBIN_API_KEY,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const data = await response.json();
+    const binData = data.record;
+
+    // Load rooms data
+    if (binData.rooms) {
+      Object.entries(binData.rooms).forEach(([pin, users]) => {
+        rooms.set(pin, new Set(users));
+      });
+    }
+
+    // Load room users
+    if (binData.users) {
+      Object.entries(binData.users).forEach(([pin, users]) => {
+        roomUsers.set(pin, users);
+      });
+    }
+
+    // Load chat history
+    if (binData.chatHistory) {
+      Object.entries(binData.chatHistory).forEach(([pin, messages]) => {
+        chatHistory.set(pin, messages);
+      });
+    }
+
+    // Load message reactions
+    if (binData.messageReactions) {
+      Object.entries(binData.messageReactions).forEach(([key, reaction]) => {
+        messageReactions.set(key, reaction);
+      });
+    }
+
+    // Load room themes
+    if (binData.roomThemes) {
+      Object.entries(binData.roomThemes).forEach(([pin, theme]) => {
+        roomThemes.set(pin, theme);
+      });
+    }
+
+    console.log('Data loaded successfully from JSONBin');
+    console.log(`Loaded ${rooms.size} rooms, ${chatHistory.size} chat histories`);
+  } catch (error) {
+    console.error('Error loading data from JSONBin:', error);
+  }
+}
+
+// Save data to JSONBin
+async function saveDataToJSONBin() {
+  try {
+    // Convert Maps to objects for JSON serialization
+    const dataToSave = {
+      rooms: Object.fromEntries(
+        Array.from(rooms.entries()).map(([pin, users]) => [pin, Array.from(users)])
+      ),
+      users: Object.fromEntries(roomUsers.entries()),
+      chatHistory: Object.fromEntries(chatHistory.entries()),
+      messageReactions: Object.fromEntries(messageReactions.entries()),
+      roomThemes: Object.fromEntries(roomThemes.entries()),
+      lastUpdated: new Date().toISOString()
+    };
+
+    const response = await fetch(JSONBIN_URL, {
+      method: 'PUT',
+      headers: {
+        'X-Master-Key': JSONBIN_API_KEY,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(dataToSave)
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const result = await response.json();
+    console.log('Data saved to JSONBin successfully');
+    return result;
+  } catch (error) {
+    console.error('Error saving data to JSONBin:', error);
+    throw error;
+  }
+}
+
+// Save data with debouncing to avoid too many API calls
+let saveTimeout;
+function scheduleSave() {
+  if (saveTimeout) {
+    clearTimeout(saveTimeout);
+  }
+  saveTimeout = setTimeout(() => {
+    saveDataToJSONBin().catch(console.error);
+  }, 2000); // Save after 2 seconds of inactivity
+}
 
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
@@ -52,7 +167,14 @@ io.on('connection', (socket) => {
     if (!roomUsers.has(pin)) {
       roomUsers.set(pin, []);
     }
-    roomUsers.get(pin).push({ socketId: socket.id, userName: userName });
+    
+    // Check if user already exists in room
+    const existingUserIndex = roomUsers.get(pin).findIndex(user => user.socketId === socket.id);
+    if (existingUserIndex === -1) {
+      roomUsers.get(pin).push({ socketId: socket.id, userName: userName });
+    } else {
+      roomUsers.get(pin)[existingUserIndex].userName = userName;
+    }
     
     // Send current theme if exists
     if (roomThemes.has(pin)) {
@@ -97,6 +219,9 @@ io.on('connection', (socket) => {
         }
       });
     }
+    
+    // Schedule save to JSONBin
+    scheduleSave();
     
     console.log(`User ${socket.id} (${userName}) joined room ${pin}`);
   });
@@ -149,6 +274,9 @@ io.on('connection', (socket) => {
         status: 'delivered'
       });
     }
+
+    // Schedule save to JSONBin
+    scheduleSave();
   });
 
   socket.on('message_delivered', (data) => {
@@ -188,6 +316,9 @@ io.on('connection', (socket) => {
       messageId: messageId,
       reaction: reaction
     });
+
+    // Schedule save to JSONBin
+    scheduleSave();
   });
 
   socket.on('unsend_message', (data) => {
@@ -207,6 +338,9 @@ io.on('connection', (socket) => {
     io.to(pin).emit('message_unsent', {
       messageId: messageId
     });
+    
+    // Schedule save to JSONBin
+    scheduleSave();
     
     console.log(`Message ${messageId} unsent in room ${pin}`);
   });
@@ -229,6 +363,9 @@ io.on('connection', (socket) => {
     
     // Broadcast theme change to all users in the room
     io.to(pin).emit('theme_changed', { theme: theme });
+
+    // Schedule save to JSONBin
+    scheduleSave();
   });
 
   socket.on('delete_room', (data) => {
@@ -255,6 +392,9 @@ io.on('connection', (socket) => {
     
     // Notify all users in the room
     io.to(pin).emit('room_deleted');
+    
+    // Schedule save to JSONBin
+    scheduleSave();
     
     console.log(`Room ${pin} deleted`);
   });
@@ -290,6 +430,9 @@ io.on('connection', (socket) => {
                 roomUsers.delete(pin);
               }
               console.log(`Room ${pin} cleared (no users)`);
+              
+              // Schedule save to JSONBin
+              scheduleSave();
             }
           }, 30000); // Wait 30 seconds before clearing empty room
         } else {
@@ -303,6 +446,9 @@ io.on('connection', (socket) => {
       
       socket.leave(pin);
       socket.room = null;
+
+      // Schedule save to JSONBin
+      scheduleSave();
     }
   });
 
@@ -337,6 +483,9 @@ io.on('connection', (socket) => {
                 roomUsers.delete(socket.room);
               }
               console.log(`Room ${socket.room} cleared (no users)`);
+              
+              // Schedule save to JSONBin
+              scheduleSave();
             }
           }, 30000); // Wait 30 seconds before clearing empty room
         } else {
@@ -347,11 +496,23 @@ io.on('connection', (socket) => {
           });
         }
       }
+
+      // Schedule save to JSONBin
+      scheduleSave();
     }
   });
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+// Load data when server starts
+loadDataFromJSONBin().then(() => {
+  const PORT = process.env.PORT || 3000;
+  server.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}).catch(error => {
+  console.error('Failed to load data from JSONBin, starting server anyway:', error);
+  const PORT = process.env.PORT || 3000;
+  server.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
 });
