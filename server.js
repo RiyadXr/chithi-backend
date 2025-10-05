@@ -2,55 +2,14 @@ const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
-const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-
-// Serve uploaded images statically
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
-
 const server = http.createServer(app);
 const io = socketIo(server, {
   cors: {
     origin: "*",
     methods: ["GET", "POST"]
-  },
-  maxHttpBufferSize: 1e8 // 100MB limit for file uploads
-});
-
-// Create uploads directory if it doesn't exist
-const uploadsDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-}
-
-// Configure multer for file uploads
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, 'uploads/');
-  },
-  filename: function (req, file, cb) {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, 'image-' + uniqueSuffix + path.extname(file.originalname));
-  }
-});
-
-const upload = multer({
-  storage: storage,
-  limits: {
-    fileSize: 10 * 1024 * 1024 // 10MB limit
-  },
-  fileFilter: function (req, file, cb) {
-    if (file.mimetype.startsWith('image/')) {
-      cb(null, true);
-    } else {
-      cb(new Error('Only image files are allowed!'), false);
-    }
   }
 });
 
@@ -66,49 +25,6 @@ const chatHistory = new Map();
 const roomUsers = new Map();
 // Store message status (sent, delivered, seen)
 const messageStatus = new Map();
-
-// HTTP route for image upload
-app.post('/upload-image', upload.single('image'), (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No image file provided' });
-    }
-
-    const imageUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
-    
-    res.json({
-      success: true,
-      imageUrl: imageUrl,
-      filename: req.file.filename
-    });
-  } catch (error) {
-    console.error('Upload error:', error);
-    res.status(500).json({ error: 'Failed to upload image' });
-  }
-});
-
-// Clean up old files periodically (optional)
-setInterval(() => {
-  const now = Date.now();
-  const maxAge = 24 * 60 * 60 * 1000; // 24 hours
-  
-  fs.readdir(uploadsDir, (err, files) => {
-    if (err) return;
-    
-    files.forEach(file => {
-      const filePath = path.join(uploadsDir, file);
-      fs.stat(filePath, (err, stat) => {
-        if (err) return;
-        
-        if (now - stat.mtime.getTime() > maxAge) {
-          fs.unlink(filePath, err => {
-            if (!err) console.log('Cleaned up old file:', file);
-          });
-        }
-      });
-    });
-  });
-}, 60 * 60 * 1000); // Run every hour
 
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
@@ -193,7 +109,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('send_message', (data) => {
-    const { pin, message, timestamp, messageId, sender, replyTo, imageUrl, imageCaption } = data;
+    const { pin, message, timestamp, messageId, sender, replyTo } = data;
     
     // Store message in history
     if (!chatHistory.has(pin)) {
@@ -201,14 +117,7 @@ io.on('connection', (socket) => {
     }
     
     const messageData = {
-      message, 
-      sender, 
-      timestamp, 
-      messageId, 
-      type: 'received', 
-      replyTo,
-      imageUrl,
-      imageCaption
+      message, sender, timestamp, messageId, type: 'received', replyTo
     };
     
     chatHistory.get(pin).push(messageData);
@@ -229,9 +138,7 @@ io.on('connection', (socket) => {
       sender: sender,
       timestamp: timestamp,
       messageId: messageId,
-      replyTo: replyTo,
-      imageUrl: imageUrl,
-      imageCaption: imageCaption
+      replyTo: replyTo
     });
 
     // Update status to delivered if there are other users
@@ -242,44 +149,6 @@ io.on('connection', (socket) => {
         status: 'delivered'
       });
     }
-  });
-
-  // Handle base64 image upload (fallback)
-  socket.on('send_image_message', (data) => {
-    const { pin, imageData, imageCaption, timestamp, messageId, sender } = data;
-    
-    // Store message in history
-    if (!chatHistory.has(pin)) {
-      chatHistory.set(pin, []);
-    }
-    
-    const messageData = {
-      message: imageCaption || '📷 Image',
-      sender: sender,
-      timestamp: timestamp,
-      messageId: messageId,
-      type: 'received',
-      imageUrl: imageData, // base64 data
-      imageCaption: imageCaption,
-      isBase64: true
-    };
-    
-    chatHistory.get(pin).push(messageData);
-    
-    // Keep only last 100 messages
-    if (chatHistory.get(pin).length > 100) {
-      chatHistory.set(pin, chatHistory.get(pin).slice(-100));
-    }
-
-    // Broadcast image message to others in the room
-    socket.to(pin).emit('image_message', {
-      sender: sender,
-      timestamp: timestamp,
-      messageId: messageId,
-      imageData: imageData,
-      imageCaption: imageCaption,
-      isBase64: true
-    });
   });
 
   socket.on('message_delivered', (data) => {
@@ -326,19 +195,7 @@ io.on('connection', (socket) => {
     
     // Remove message from history
     if (chatHistory.has(pin)) {
-      const message = chatHistory.get(pin).find(msg => msg.messageId === messageId);
       chatHistory.set(pin, chatHistory.get(pin).filter(msg => msg.messageId !== messageId));
-      
-      // Delete image file if it exists
-      if (message && message.imageUrl && !message.isBase64) {
-        const filename = path.basename(message.imageUrl);
-        const filePath = path.join(uploadsDir, filename);
-        
-        fs.unlink(filePath, (err) => {
-          if (err) console.error('Error deleting image file:', err);
-          else console.log('Deleted image file:', filename);
-        });
-      }
     }
     
     // Remove message status
@@ -376,20 +233,6 @@ io.on('connection', (socket) => {
 
   socket.on('delete_room', (data) => {
     const { pin } = data;
-    
-    // Clear all image files for this room
-    if (chatHistory.has(pin)) {
-      chatHistory.get(pin).forEach(message => {
-        if (message.imageUrl && !message.isBase64) {
-          const filename = path.basename(message.imageUrl);
-          const filePath = path.join(uploadsDir, filename);
-          
-          fs.unlink(filePath, (err) => {
-            if (!err) console.log('Deleted room image:', filename);
-          });
-        }
-      });
-    }
     
     // Clear room data
     if (rooms.has(pin)) {
@@ -511,5 +354,4 @@ io.on('connection', (socket) => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  console.log(`Image uploads directory: ${uploadsDir}`);
 });
