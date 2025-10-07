@@ -2,12 +2,9 @@ const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
-const fetch = require('node-fetch');
-const webpush = require('web-push');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
 const server = http.createServer(app);
 const io = socketIo(server, {
   cors: {
@@ -15,21 +12,6 @@ const io = socketIo(server, {
     methods: ["GET", "POST"]
   }
 });
-
-// JSONBin configuration
-const JSONBIN_BIN_ID = "68e223bc43b1c97be95ad96d";
-const JSONBIN_API_KEY = "$2a$10$nCvtrBD0oAjmgXA5JAjTJ.3O5cDYYn7t7QpgqevUchxQTb5V4mBOO";
-const JSONBIN_URL = `https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}`;
-
-// VAPID keys for push notifications (Generate your own using: web-push generate-vapid-keys)
-const VAPID_PUBLIC_KEY = 'BLx1h6b9M-2v8J7k4cR3wE5tY6uI8oP0qA2sD4fG7hJ1kL3zX5cV8bN9mQ0wS2eR4tY6uI8oP0q';
-const VAPID_PRIVATE_KEY = 'S2d4fG7hJ1kL3zX5cV8bN9mQ0wS2eR4tY6uI8oP0qA2sD4fG7hJ1kL3zX5cV8bN9m';
-
-webpush.setVapidDetails(
-  'mailto:your-email@example.com',
-  VAPID_PUBLIC_KEY,
-  VAPID_PRIVATE_KEY
-);
 
 // Store active rooms and their users
 const rooms = new Map();
@@ -43,314 +25,6 @@ const chatHistory = new Map();
 const roomUsers = new Map();
 // Store message status (sent, delivered, seen)
 const messageStatus = new Map();
-// Store push subscriptions for users
-const pushSubscriptions = new Map();
-
-// Load data from JSONBin on server start
-async function loadDataFromJSONBin() {
-  try {
-    console.log('Loading data from JSONBin...');
-    const response = await fetch(JSONBIN_URL, {
-      method: 'GET',
-      headers: {
-        'X-Master-Key': JSONBIN_API_KEY,
-        'Content-Type': 'application/json'
-      }
-    });
-
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-
-    const data = await response.json();
-    const binData = data.record;
-
-    // Load rooms data
-    if (binData.rooms) {
-      Object.entries(binData.rooms).forEach(([pin, users]) => {
-        rooms.set(pin, new Set(users));
-      });
-    }
-
-    // Load room users
-    if (binData.users) {
-      Object.entries(binData.users).forEach(([pin, users]) => {
-        roomUsers.set(pin, users);
-      });
-    }
-
-    // Load chat history
-    if (binData.chatHistory) {
-      Object.entries(binData.chatHistory).forEach(([pin, messages]) => {
-        chatHistory.set(pin, messages);
-      });
-    }
-
-    // Load message reactions
-    if (binData.messageReactions) {
-      Object.entries(binData.messageReactions).forEach(([key, reaction]) => {
-        messageReactions.set(key, reaction);
-      });
-    }
-
-    // Load room themes
-    if (binData.roomThemes) {
-      Object.entries(binData.roomThemes).forEach(([pin, theme]) => {
-        roomThemes.set(pin, theme);
-      });
-    }
-
-    // Load push subscriptions
-    if (binData.pushSubscriptions) {
-      Object.entries(binData.pushSubscriptions).forEach(([socketId, subscription]) => {
-        pushSubscriptions.set(socketId, subscription);
-      });
-    }
-
-    console.log('Data loaded successfully from JSONBin');
-    console.log(`Loaded ${rooms.size} rooms, ${chatHistory.size} chat histories, ${pushSubscriptions.size} push subscriptions`);
-  } catch (error) {
-    console.error('Error loading data from JSONBin:', error);
-  }
-}
-
-// Enhanced function to save comprehensive data to JSONBin
-async function saveComprehensiveDataToJSONBin() {
-  try {
-    // Get current timestamp
-    const currentTime = new Date().toISOString();
-    
-    // Convert Maps to objects for JSON serialization
-    const activeRoomsData = Object.fromEntries(
-      Array.from(rooms.entries()).map(([pin, users]) => [pin, Array.from(users)])
-    );
-    
-    const activeUsersData = Object.fromEntries(roomUsers.entries());
-    const activeChatHistory = Object.fromEntries(chatHistory.entries());
-    const activeMessageReactions = Object.fromEntries(messageReactions.entries());
-    const activeRoomThemes = Object.fromEntries(roomThemes.entries());
-    const activePushSubscriptions = Object.fromEntries(pushSubscriptions.entries());
-
-    // First, load existing data to preserve deleted room information
-    let existingData = {};
-    try {
-      const response = await fetch(JSONBIN_URL, {
-        method: 'GET',
-        headers: {
-          'X-Master-Key': JSONBIN_API_KEY,
-          'Content-Type': 'application/json'
-        }
-      });
-      
-      if (response.ok) {
-        const data = await response.json();
-        existingData = data.record || {};
-      }
-    } catch (error) {
-      console.error('Error loading existing data:', error);
-    }
-
-    // Prepare comprehensive data structure
-    const comprehensiveData = {
-      // Active data (current state)
-      activeRooms: activeRoomsData,
-      activeUsers: activeUsersData,
-      activeChatHistory: activeChatHistory,
-      activeMessageReactions: activeMessageReactions,
-      activeRoomThemes: activeRoomThemes,
-      pushSubscriptions: activePushSubscriptions,
-      
-      // Archive data (preserve deleted rooms)
-      archivedRooms: {
-        ...(existingData.archivedRooms || {}),
-        ...activeChatHistory
-      },
-      
-      // User activity log
-      userActivity: [
-        ...(existingData.userActivity || []),
-        {
-          timestamp: currentTime,
-          activeUsers: Object.values(activeUsersData).flat().length,
-          activeRooms: Object.keys(activeRoomsData).length,
-          totalMessages: Object.values(activeChatHistory).flat().length
-        }
-      ].slice(-1000), // Keep last 1000 activity records
-      
-      // Room statistics
-      roomStatistics: Object.fromEntries(
-        Object.entries(activeChatHistory).map(([pin, messages]) => [
-          pin,
-          {
-            messageCount: messages.length,
-            lastActivity: messages.length > 0 ? messages[messages.length - 1].timestamp : currentTime,
-            users: activeUsersData[pin] || [],
-            theme: activeRoomThemes[pin] || 'default'
-          }
-        ])
-      ),
-      
-      lastUpdated: currentTime,
-      serverStartTime: existingData.serverStartTime || currentTime
-    };
-
-    const response = await fetch(JSONBIN_URL, {
-      method: 'PUT',
-      headers: {
-        'X-Master-Key': JSONBIN_API_KEY,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(comprehensiveData)
-    });
-
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-
-    const result = await response.json();
-    console.log('Comprehensive data saved to JSONBin successfully');
-    return result;
-  } catch (error) {
-    console.error('Error saving comprehensive data to JSONBin:', error);
-    throw error;
-  }
-}
-
-// Save data with debouncing to avoid too many API calls
-let saveTimeout;
-function scheduleSave() {
-  if (saveTimeout) {
-    clearTimeout(saveTimeout);
-  }
-  saveTimeout = setTimeout(() => {
-    saveComprehensiveDataToJSONBin().catch(console.error);
-  }, 3000); // Save after 3 seconds of inactivity
-}
-
-// Function to archive room data before deletion
-async function archiveRoomData(pin) {
-  try {
-    // Load existing data
-    const response = await fetch(JSONBIN_URL, {
-      method: 'GET',
-      headers: {
-        'X-Master-Key': JSONBIN_API_KEY,
-        'Content-Type': 'application/json'
-      }
-    });
-
-    if (!response.ok) return;
-
-    const data = await response.json();
-    const existingData = data.record || {};
-
-    // Prepare archived room data
-    const roomArchive = {
-      pin: pin,
-      roomUsers: roomUsers.get(pin) || [],
-      chatHistory: chatHistory.get(pin) || [],
-      messageReactions: Array.from(messageReactions.entries())
-        .filter(([key]) => key.startsWith(`${pin}-`))
-        .reduce((acc, [key, value]) => {
-          acc[key] = value;
-          return acc;
-        }, {}),
-      theme: roomThemes.get(pin) || 'default',
-      deletedAt: new Date().toISOString(),
-      messageCount: chatHistory.get(pin)?.length || 0,
-      userCount: roomUsers.get(pin)?.length || 0
-    };
-
-    // Update existing data with archive
-    const updatedData = {
-      ...existingData,
-      archivedRooms: {
-        ...(existingData.archivedRooms || {}),
-        [pin]: roomArchive
-      },
-      deletionLog: [
-        ...(existingData.deletionLog || []),
-        {
-          pin: pin,
-          deletedAt: new Date().toISOString(),
-          reason: 'user_deletion',
-          finalMessageCount: chatHistory.get(pin)?.length || 0,
-          finalUserCount: roomUsers.get(pin)?.length || 0
-        }
-      ].slice(-100) // Keep last 100 deletion logs
-    };
-
-    // Save archived data
-    await fetch(JSONBIN_URL, {
-      method: 'PUT',
-      headers: {
-        'X-Master-Key': JSONBIN_API_KEY,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(updatedData)
-    });
-
-    console.log(`Room ${pin} data archived successfully`);
-  } catch (error) {
-    console.error('Error archiving room data:', error);
-  }
-}
-
-// Function to send push notification
-async function sendPushNotification(subscription, payload) {
-  try {
-    await webpush.sendNotification(subscription, JSON.stringify(payload));
-    console.log('Push notification sent successfully');
-  } catch (error) {
-    console.error('Error sending push notification:', error);
-    // Remove invalid subscriptions
-    if (error.statusCode === 410) {
-      for (let [socketId, sub] of pushSubscriptions.entries()) {
-        if (JSON.stringify(sub) === JSON.stringify(subscription)) {
-          pushSubscriptions.delete(socketId);
-          console.log('Removed invalid push subscription');
-          scheduleSave();
-          break;
-        }
-      }
-    }
-  }
-}
-
-// Function to send notifications to all users in room except sender
-function sendNotificationsToRoom(pin, senderSocketId, notificationPayload) {
-  if (rooms.has(pin)) {
-    const roomUsersSet = rooms.get(pin);
-    roomUsersSet.forEach(socketId => {
-      // Don't send notification to the sender
-      if (socketId !== senderSocketId) {
-        const subscription = pushSubscriptions.get(socketId);
-        if (subscription) {
-          sendPushNotification(subscription, notificationPayload);
-        }
-      }
-    });
-  }
-}
-
-// API endpoint to get VAPID public key
-app.get('/vapid-public-key', (req, res) => {
-  res.json({ publicKey: VAPID_PUBLIC_KEY });
-});
-
-// API endpoint to save push subscription
-app.post('/save-subscription', express.json(), (req, res) => {
-  const { subscription, socketId } = req.body;
-  
-  if (!subscription || !socketId) {
-    return res.status(400).json({ error: 'Subscription and socketId are required' });
-  }
-
-  pushSubscriptions.set(socketId, subscription);
-  scheduleSave();
-  
-  res.json({ success: true, message: 'Subscription saved successfully' });
-});
 
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
@@ -378,19 +52,7 @@ io.on('connection', (socket) => {
     if (!roomUsers.has(pin)) {
       roomUsers.set(pin, []);
     }
-    
-    // Check if user already exists in room
-    const existingUserIndex = roomUsers.get(pin).findIndex(user => user.socketId === socket.id);
-    if (existingUserIndex === -1) {
-      roomUsers.get(pin).push({ 
-        socketId: socket.id, 
-        userName: userName,
-        joinedAt: new Date().toISOString()
-      });
-    } else {
-      roomUsers.get(pin)[existingUserIndex].userName = userName;
-      roomUsers.get(pin)[existingUserIndex].lastActive = new Date().toISOString();
-    }
+    roomUsers.get(pin).push({ socketId: socket.id, userName: userName });
     
     // Send current theme if exists
     if (roomThemes.has(pin)) {
@@ -414,24 +76,6 @@ io.on('connection', (socket) => {
       userName: userName
     });
 
-    // Send push notification to other users in the room
-    if (rooms.get(pin).size > 1) {
-      const notificationPayload = {
-        title: 'Chithi - User Joined',
-        body: `${userName} joined the room`,
-        icon: '/icon-192.png',
-        badge: '/badge-72.png',
-        tag: `room-${pin}`,
-        data: {
-          url: `${req.headers.origin || ''}?room=${pin}`,
-          room: pin,
-          type: 'user_joined'
-        }
-      };
-      
-      sendNotificationsToRoom(pin, socket.id, notificationPayload);
-    }
-
     // Update message status for all messages when user joins
     if (chatHistory.has(pin)) {
       chatHistory.get(pin).forEach(message => {
@@ -454,9 +98,6 @@ io.on('connection', (socket) => {
       });
     }
     
-    // Schedule save to JSONBin
-    scheduleSave();
-    
     console.log(`User ${socket.id} (${userName}) joined room ${pin}`);
   });
 
@@ -476,14 +117,7 @@ io.on('connection', (socket) => {
     }
     
     const messageData = {
-      message, 
-      sender, 
-      timestamp, 
-      messageId, 
-      type: 'received', 
-      replyTo,
-      sentAt: new Date().toISOString(),
-      pin: pin
+      message, sender, timestamp, messageId, type: 'received', replyTo
     };
     
     chatHistory.get(pin).push(messageData);
@@ -507,25 +141,6 @@ io.on('connection', (socket) => {
       replyTo: replyTo
     });
 
-    // Send push notification to other users in the room
-    if (rooms.has(pin) && rooms.get(pin).size > 1) {
-      const notificationPayload = {
-        title: `New message from ${sender}`,
-        body: message.length > 50 ? message.substring(0, 50) + '...' : message,
-        icon: '/icon-192.png',
-        badge: '/badge-72.png',
-        tag: `message-${messageId}`,
-        data: {
-          url: `${req.headers.origin || ''}?room=${pin}`,
-          room: pin,
-          messageId: messageId,
-          type: 'new_message'
-        }
-      };
-      
-      sendNotificationsToRoom(pin, socket.id, notificationPayload);
-    }
-
     // Update status to delivered if there are other users
     if (rooms.has(pin) && rooms.get(pin).size > 1) {
       messageStatus.get(messageId).delivered = true;
@@ -534,9 +149,6 @@ io.on('connection', (socket) => {
         status: 'delivered'
       });
     }
-
-    // Schedule save to JSONBin
-    scheduleSave();
   });
 
   socket.on('message_delivered', (data) => {
@@ -576,9 +188,6 @@ io.on('connection', (socket) => {
       messageId: messageId,
       reaction: reaction
     });
-
-    // Schedule save to JSONBin
-    scheduleSave();
   });
 
   socket.on('unsend_message', (data) => {
@@ -598,9 +207,6 @@ io.on('connection', (socket) => {
     io.to(pin).emit('message_unsent', {
       messageId: messageId
     });
-    
-    // Schedule save to JSONBin
-    scheduleSave();
     
     console.log(`Message ${messageId} unsent in room ${pin}`);
   });
@@ -623,18 +229,12 @@ io.on('connection', (socket) => {
     
     // Broadcast theme change to all users in the room
     io.to(pin).emit('theme_changed', { theme: theme });
-
-    // Schedule save to JSONBin
-    scheduleSave();
   });
 
-  socket.on('delete_room', async (data) => {
+  socket.on('delete_room', (data) => {
     const { pin } = data;
     
-    // Archive room data before deletion
-    await archiveRoomData(pin);
-    
-    // Clear room data from active memory
+    // Clear room data
     if (rooms.has(pin)) {
       rooms.delete(pin);
     }
@@ -656,17 +256,7 @@ io.on('connection', (socket) => {
     // Notify all users in the room
     io.to(pin).emit('room_deleted');
     
-    // Final save to update active data
-    scheduleSave();
-    
-    console.log(`Room ${pin} deleted and archived`);
-  });
-
-  socket.on('register_push', (data) => {
-    const { subscription } = data;
-    pushSubscriptions.set(socket.id, subscription);
-    scheduleSave();
-    console.log(`Push notification registered for socket ${socket.id}`);
+    console.log(`Room ${pin} deleted`);
   });
 
   socket.on('leave_room', (data) => {
@@ -700,9 +290,6 @@ io.on('connection', (socket) => {
                 roomUsers.delete(pin);
               }
               console.log(`Room ${pin} cleared (no users)`);
-              
-              // Schedule save to JSONBin
-              scheduleSave();
             }
           }, 30000); // Wait 30 seconds before clearing empty room
         } else {
@@ -716,20 +303,11 @@ io.on('connection', (socket) => {
       
       socket.leave(pin);
       socket.room = null;
-
-      // Schedule save to JSONBin
-      scheduleSave();
     }
   });
 
   socket.on('disconnect', () => {
     console.log('User disconnected:', socket.id);
-    
-    // Remove push subscription
-    if (pushSubscriptions.has(socket.id)) {
-      pushSubscriptions.delete(socket.id);
-      scheduleSave();
-    }
     
     if (socket.room) {
       // Remove user from room
@@ -759,9 +337,6 @@ io.on('connection', (socket) => {
                 roomUsers.delete(socket.room);
               }
               console.log(`Room ${socket.room} cleared (no users)`);
-              
-              // Schedule save to JSONBin
-              scheduleSave();
             }
           }, 30000); // Wait 30 seconds before clearing empty room
         } else {
@@ -772,30 +347,11 @@ io.on('connection', (socket) => {
           });
         }
       }
-
-      // Schedule save to JSONBin
-      scheduleSave();
     }
   });
 });
 
-// Load data when server starts
-loadDataFromJSONBin().then(() => {
-  const PORT = process.env.PORT || 3000;
-  server.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-    console.log('JSONBin persistence is active - all data will be saved including deleted rooms');
-    console.log('Push notifications are enabled with VAPID public key:', VAPID_PUBLIC_KEY);
-  });
-}).catch(error => {
-  console.error('Failed to load data from JSONBin, starting server anyway:', error);
-  const PORT = process.env.PORT || 3000;
-  server.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-  });
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
-
-// Save data periodically (every 5 minutes) as backup
-setInterval(() => {
-  saveComprehensiveDataToJSONBin().catch(console.error);
-}, 5 * 60 * 1000);
