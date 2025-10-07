@@ -329,6 +329,13 @@ io.on('connection', (socket) => {
       socket.emit('chat_history', { messages: chatHistory.get(pin) });
     }
     
+    // Send browser notification to other users in the room
+    socket.to(pin).emit('browser_notification', {
+      title: 'চিঠি - New User Joined',
+      message: `${userName} joined the chat`,
+      type: 'user_join'
+    });
+
     // Notify others in the room
     socket.to(pin).emit('user_joined', { 
       message: 'A user joined the chat',
@@ -401,6 +408,14 @@ io.on('connection', (socket) => {
       messageStatus.set(messageId, {});
     }
     
+    // Send browser notification to other users in the room
+    socket.to(pin).emit('browser_notification', {
+      title: `চিঠি - Message from ${sender}`,
+      message: message.length > 50 ? message.substring(0, 50) + '...' : message,
+      type: 'new_message',
+      sender: sender
+    });
+
     // Broadcast message to others in the room
     socket.to(pin).emit('message', {
       message: message,
@@ -565,6 +580,13 @@ io.on('connection', (socket) => {
         // Update user count
         io.to(pin).emit('user_count_update', { count: rooms.get(pin).size });
         
+        // Send browser notification about user leaving
+        socket.to(pin).emit('browser_notification', {
+          title: 'চিঠি - User Left',
+          message: `${socket.userName} left the chat`,
+          type: 'user_left'
+        });
+        
         // If room is empty, delete it after a delay
         if (rooms.get(pin).size === 0) {
           setTimeout(() => {
@@ -617,6 +639,13 @@ io.on('connection', (socket) => {
         
         // Update user count
         io.to(socket.room).emit('user_count_update', { count: rooms.get(socket.room).size });
+        
+        // Send browser notification about user disconnection
+        socket.to(socket.room).emit('browser_notification', {
+          title: 'চিঠি - User Left',
+          message: `${socket.userName} left the chat`,
+          type: 'user_left'
+        });
         
         // If room is empty, delete it after a delay
         if (rooms.get(socket.room).size === 0) {
