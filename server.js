@@ -3,9 +3,11 @@ const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
 const fetch = require('node-fetch');
+const webpush = require('web-push');
 
 const app = express();
 app.use(cors());
+app.use(express.json());
 const server = http.createServer(app);
 const io = socketIo(server, {
   cors: {
@@ -19,6 +21,16 @@ const JSONBIN_BIN_ID = "68e223bc43b1c97be95ad96d";
 const JSONBIN_API_KEY = "$2a$10$nCvtrBD0oAjmgXA5JAjTJ.3O5cDYYn7t7QpgqevUchxQTb5V4mBOO";
 const JSONBIN_URL = `https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}`;
 
+// VAPID keys for push notifications (Generate your own using: web-push generate-vapid-keys)
+const VAPID_PUBLIC_KEY = 'BLx1h6b9M-2v8J7k4cR3wE5tY6uI8oP0qA2sD4fG7hJ1kL3zX5cV8bN9mQ0wS2eR4tY6uI8oP0q';
+const VAPID_PRIVATE_KEY = 'S2d4fG7hJ1kL3zX5cV8bN9mQ0wS2eR4tY6uI8oP0qA2sD4fG7hJ1kL3zX5cV8bN9m';
+
+webpush.setVapidDetails(
+  'mailto:your-email@example.com',
+  VAPID_PUBLIC_KEY,
+  VAPID_PRIVATE_KEY
+);
+
 // Store active rooms and their users
 const rooms = new Map();
 // Store message reactions
@@ -31,6 +43,8 @@ const chatHistory = new Map();
 const roomUsers = new Map();
 // Store message status (sent, delivered, seen)
 const messageStatus = new Map();
+// Store push subscriptions for users
+const pushSubscriptions = new Map();
 
 // Load data from JSONBin on server start
 async function loadDataFromJSONBin() {
@@ -86,8 +100,15 @@ async function loadDataFromJSONBin() {
       });
     }
 
+    // Load push subscriptions
+    if (binData.pushSubscriptions) {
+      Object.entries(binData.pushSubscriptions).forEach(([socketId, subscription]) => {
+        pushSubscriptions.set(socketId, subscription);
+      });
+    }
+
     console.log('Data loaded successfully from JSONBin');
-    console.log(`Loaded ${rooms.size} rooms, ${chatHistory.size} chat histories`);
+    console.log(`Loaded ${rooms.size} rooms, ${chatHistory.size} chat histories, ${pushSubscriptions.size} push subscriptions`);
   } catch (error) {
     console.error('Error loading data from JSONBin:', error);
   }
@@ -108,6 +129,7 @@ async function saveComprehensiveDataToJSONBin() {
     const activeChatHistory = Object.fromEntries(chatHistory.entries());
     const activeMessageReactions = Object.fromEntries(messageReactions.entries());
     const activeRoomThemes = Object.fromEntries(roomThemes.entries());
+    const activePushSubscriptions = Object.fromEntries(pushSubscriptions.entries());
 
     // First, load existing data to preserve deleted room information
     let existingData = {};
@@ -136,6 +158,7 @@ async function saveComprehensiveDataToJSONBin() {
       activeChatHistory: activeChatHistory,
       activeMessageReactions: activeMessageReactions,
       activeRoomThemes: activeRoomThemes,
+      pushSubscriptions: activePushSubscriptions,
       
       // Archive data (preserve deleted rooms)
       archivedRooms: {
@@ -273,6 +296,62 @@ async function archiveRoomData(pin) {
   }
 }
 
+// Function to send push notification
+async function sendPushNotification(subscription, payload) {
+  try {
+    await webpush.sendNotification(subscription, JSON.stringify(payload));
+    console.log('Push notification sent successfully');
+  } catch (error) {
+    console.error('Error sending push notification:', error);
+    // Remove invalid subscriptions
+    if (error.statusCode === 410) {
+      for (let [socketId, sub] of pushSubscriptions.entries()) {
+        if (JSON.stringify(sub) === JSON.stringify(subscription)) {
+          pushSubscriptions.delete(socketId);
+          console.log('Removed invalid push subscription');
+          scheduleSave();
+          break;
+        }
+      }
+    }
+  }
+}
+
+// Function to send notifications to all users in room except sender
+function sendNotificationsToRoom(pin, senderSocketId, notificationPayload) {
+  if (rooms.has(pin)) {
+    const roomUsersSet = rooms.get(pin);
+    roomUsersSet.forEach(socketId => {
+      // Don't send notification to the sender
+      if (socketId !== senderSocketId) {
+        const subscription = pushSubscriptions.get(socketId);
+        if (subscription) {
+          sendPushNotification(subscription, notificationPayload);
+        }
+      }
+    });
+  }
+}
+
+// API endpoint to get VAPID public key
+app.get('/vapid-public-key', (req, res) => {
+  res.json({ publicKey: VAPID_PUBLIC_KEY });
+});
+
+// API endpoint to save push subscription
+app.post('/save-subscription', express.json(), (req, res) => {
+  const { subscription, socketId } = req.body;
+  
+  if (!subscription || !socketId) {
+    return res.status(400).json({ error: 'Subscription and socketId are required' });
+  }
+
+  pushSubscriptions.set(socketId, subscription);
+  scheduleSave();
+  
+  res.json({ success: true, message: 'Subscription saved successfully' });
+});
+
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
@@ -329,18 +408,29 @@ io.on('connection', (socket) => {
       socket.emit('chat_history', { messages: chatHistory.get(pin) });
     }
     
-    // Send browser notification to other users in the room
-    socket.to(pin).emit('browser_notification', {
-      title: 'চিঠি - New User Joined',
-      message: `${userName} joined the chat`,
-      type: 'user_join'
-    });
-
     // Notify others in the room
     socket.to(pin).emit('user_joined', { 
       message: 'A user joined the chat',
       userName: userName
     });
+
+    // Send push notification to other users in the room
+    if (rooms.get(pin).size > 1) {
+      const notificationPayload = {
+        title: 'Chithi - User Joined',
+        body: `${userName} joined the room`,
+        icon: '/icon-192.png',
+        badge: '/badge-72.png',
+        tag: `room-${pin}`,
+        data: {
+          url: `${req.headers.origin || ''}?room=${pin}`,
+          room: pin,
+          type: 'user_joined'
+        }
+      };
+      
+      sendNotificationsToRoom(pin, socket.id, notificationPayload);
+    }
 
     // Update message status for all messages when user joins
     if (chatHistory.has(pin)) {
@@ -408,14 +498,6 @@ io.on('connection', (socket) => {
       messageStatus.set(messageId, {});
     }
     
-    // Send browser notification to other users in the room
-    socket.to(pin).emit('browser_notification', {
-      title: `চিঠি - Message from ${sender}`,
-      message: message.length > 50 ? message.substring(0, 50) + '...' : message,
-      type: 'new_message',
-      sender: sender
-    });
-
     // Broadcast message to others in the room
     socket.to(pin).emit('message', {
       message: message,
@@ -424,6 +506,25 @@ io.on('connection', (socket) => {
       messageId: messageId,
       replyTo: replyTo
     });
+
+    // Send push notification to other users in the room
+    if (rooms.has(pin) && rooms.get(pin).size > 1) {
+      const notificationPayload = {
+        title: `New message from ${sender}`,
+        body: message.length > 50 ? message.substring(0, 50) + '...' : message,
+        icon: '/icon-192.png',
+        badge: '/badge-72.png',
+        tag: `message-${messageId}`,
+        data: {
+          url: `${req.headers.origin || ''}?room=${pin}`,
+          room: pin,
+          messageId: messageId,
+          type: 'new_message'
+        }
+      };
+      
+      sendNotificationsToRoom(pin, socket.id, notificationPayload);
+    }
 
     // Update status to delivered if there are other users
     if (rooms.has(pin) && rooms.get(pin).size > 1) {
@@ -561,6 +662,13 @@ io.on('connection', (socket) => {
     console.log(`Room ${pin} deleted and archived`);
   });
 
+  socket.on('register_push', (data) => {
+    const { subscription } = data;
+    pushSubscriptions.set(socket.id, subscription);
+    scheduleSave();
+    console.log(`Push notification registered for socket ${socket.id}`);
+  });
+
   socket.on('leave_room', (data) => {
     const { pin } = data;
     
@@ -579,13 +687,6 @@ io.on('connection', (socket) => {
         
         // Update user count
         io.to(pin).emit('user_count_update', { count: rooms.get(pin).size });
-        
-        // Send browser notification about user leaving
-        socket.to(pin).emit('browser_notification', {
-          title: 'চিঠি - User Left',
-          message: `${socket.userName} left the chat`,
-          type: 'user_left'
-        });
         
         // If room is empty, delete it after a delay
         if (rooms.get(pin).size === 0) {
@@ -624,6 +725,12 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     console.log('User disconnected:', socket.id);
     
+    // Remove push subscription
+    if (pushSubscriptions.has(socket.id)) {
+      pushSubscriptions.delete(socket.id);
+      scheduleSave();
+    }
+    
     if (socket.room) {
       // Remove user from room
       if (rooms.has(socket.room)) {
@@ -639,13 +746,6 @@ io.on('connection', (socket) => {
         
         // Update user count
         io.to(socket.room).emit('user_count_update', { count: rooms.get(socket.room).size });
-        
-        // Send browser notification about user disconnection
-        socket.to(socket.room).emit('browser_notification', {
-          title: 'চিঠি - User Left',
-          message: `${socket.userName} left the chat`,
-          type: 'user_left'
-        });
         
         // If room is empty, delete it after a delay
         if (rooms.get(socket.room).size === 0) {
@@ -685,6 +785,7 @@ loadDataFromJSONBin().then(() => {
   server.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
     console.log('JSONBin persistence is active - all data will be saved including deleted rooms');
+    console.log('Push notifications are enabled with VAPID public key:', VAPID_PUBLIC_KEY);
   });
 }).catch(error => {
   console.error('Failed to load data from JSONBin, starting server anyway:', error);
