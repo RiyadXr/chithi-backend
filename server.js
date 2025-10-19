@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
+const fetch = require('node-fetch');
 
 const app = express();
 app.use(cors());
@@ -13,18 +14,110 @@ const io = socketIo(server, {
   }
 });
 
-// Store active rooms and their users
+// JSONBin configuration
+const JSONBIN_BIN_ID = '68f5421743b1c97be971bc06';
+const JSONBIN_MASTER_KEY = '$2a$10$nCvtrBD0oAjmgXA5JAjTJ.3O5cDYYn7t7QpgqevUchxQTb5V4mBOO';
+const JSONBIN_URL = `https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}`;
+const JSONBIN_HEADERS = {
+  'Content-Type': 'application/json',
+  'X-Master-Key': JSONBIN_MASTER_KEY
+};
+
+// Store active rooms and their users (in-memory for real-time operations)
 const rooms = new Map();
-// Store message reactions
 const messageReactions = new Map();
-// Store room themes
 const roomThemes = new Map();
-// Store chat history
 const chatHistory = new Map();
-// Store room users with names
 const roomUsers = new Map();
-// Store message status (sent, delivered, seen)
 const messageStatus = new Map();
+
+// Initialize JSONBin data
+let binData = {
+  rooms: []
+};
+
+// Load data from JSONBin on server start
+async function loadBinData() {
+  try {
+    const response = await fetch(JSONBIN_URL, {
+      method: 'GET',
+      headers: JSONBIN_HEADERS
+    });
+    
+    if (response.ok) {
+      const data = await response.json();
+      binData = data.record;
+      console.log('Data loaded from JSONBin');
+      
+      // Restore active rooms to memory
+      binData.rooms.forEach(room => {
+        if (room.status === 'active') {
+          chatHistory.set(room.pin, room.messages || []);
+          roomThemes.set(room.pin, room.theme || 'default');
+        }
+      });
+    } else {
+      console.log('No existing data found in JSONBin, starting fresh');
+    }
+  } catch (error) {
+    console.error('Error loading data from JSONBin:', error);
+  }
+}
+
+// Save data to JSONBin
+async function saveToBin() {
+  try {
+    // Update binData with current state
+    binData.rooms = Array.from(rooms.keys()).map(pin => {
+      const existingRoom = binData.rooms.find(r => r.pin === pin) || {};
+      return {
+        pin: pin,
+        createdAt: existingRoom.createdAt || new Date().toISOString(),
+        messages: chatHistory.get(pin) || [],
+        theme: roomThemes.get(pin) || 'default',
+        status: 'active',
+        lastActive: new Date().toISOString(),
+        userCount: rooms.get(pin)?.size || 0
+      };
+    });
+
+    // Also update rooms that are in binData but not currently active (preserve deleted rooms)
+    const activePins = Array.from(rooms.keys());
+    binData.rooms.forEach(room => {
+      if (!activePins.includes(room.pin) && room.status === 'active') {
+        room.status = 'inactive';
+        room.lastActive = new Date().toISOString();
+      }
+    });
+
+    const response = await fetch(JSONBIN_URL, {
+      method: 'PUT',
+      headers: JSONBIN_HEADERS,
+      body: JSON.stringify(binData)
+    });
+
+    if (response.ok) {
+      console.log('Data saved to JSONBin');
+    } else {
+      console.error('Failed to save data to JSONBin');
+    }
+  } catch (error) {
+    console.error('Error saving data to JSONBin:', error);
+  }
+}
+
+// Load data when server starts
+loadBinData();
+
+// Auto-save to JSONBin every 30 seconds
+setInterval(saveToBin, 30000);
+
+// Also save on graceful shutdown
+process.on('SIGINT', async () => {
+  console.log('Saving data before shutdown...');
+  await saveToBin();
+  process.exit(0);
+});
 
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
@@ -45,6 +138,26 @@ io.on('connection', (socket) => {
     // Add user to room
     if (!rooms.has(pin)) {
       rooms.set(pin, new Set());
+      
+      // Add new room to binData if it doesn't exist
+      if (!binData.rooms.find(r => r.pin === pin)) {
+        binData.rooms.push({
+          pin: pin,
+          createdAt: new Date().toISOString(),
+          messages: [],
+          theme: 'default',
+          status: 'active',
+          lastActive: new Date().toISOString(),
+          userCount: 1
+        });
+      } else {
+        // Update existing room status to active
+        const roomIndex = binData.rooms.findIndex(r => r.pin === pin);
+        if (roomIndex !== -1) {
+          binData.rooms[roomIndex].status = 'active';
+          binData.rooms[roomIndex].lastActive = new Date().toISOString();
+        }
+      }
     }
     rooms.get(pin).add(socket.id);
     
@@ -80,13 +193,11 @@ io.on('connection', (socket) => {
     if (chatHistory.has(pin)) {
       chatHistory.get(pin).forEach(message => {
         if (message.type === 'received') {
-          // Update status to delivered for all received messages
           if (!messageStatus.has(message.messageId)) {
             messageStatus.set(message.messageId, {});
           }
           messageStatus.get(message.messageId).delivered = true;
           
-          // Notify sender about delivery
           const sender = roomUsers.get(pin).find(user => user.userName === message.sender);
           if (sender) {
             io.to(sender.socketId).emit('message_status_update', {
@@ -96,6 +207,13 @@ io.on('connection', (socket) => {
           }
         }
       });
+    }
+    
+    // Update room data in binData
+    const roomIndex = binData.rooms.findIndex(r => r.pin === pin);
+    if (roomIndex !== -1) {
+      binData.rooms[roomIndex].userCount = rooms.get(pin).size;
+      binData.rooms[roomIndex].lastActive = new Date().toISOString();
     }
     
     console.log(`User ${socket.id} (${userName}) joined room ${pin}`);
@@ -132,6 +250,13 @@ io.on('connection', (socket) => {
       messageStatus.set(messageId, {});
     }
     
+    // Update binData with new message
+    const roomIndex = binData.rooms.findIndex(r => r.pin === pin);
+    if (roomIndex !== -1) {
+      binData.rooms[roomIndex].messages = chatHistory.get(pin);
+      binData.rooms[roomIndex].lastActive = new Date().toISOString();
+    }
+    
     // Broadcast message to others in the room
     socket.to(pin).emit('message', {
       message: message,
@@ -157,7 +282,6 @@ io.on('connection', (socket) => {
     if (messageStatus.has(messageId)) {
       messageStatus.get(messageId).delivered = true;
       
-      // Notify sender about delivery
       const message = chatHistory.get(pin)?.find(msg => msg.messageId === messageId);
       if (message) {
         const sender = roomUsers.get(pin)?.find(user => user.userName === message.sender);
@@ -174,7 +298,6 @@ io.on('connection', (socket) => {
   socket.on('message_reaction', (data) => {
     const { pin, messageId, reaction } = data;
     
-    // Store reaction
     const reactionKey = `${pin}-${messageId}`;
     if (!messageReactions.has(reactionKey)) {
       messageReactions.set(reactionKey, {});
@@ -183,7 +306,6 @@ io.on('connection', (socket) => {
     const reactions = messageReactions.get(reactionKey);
     reactions[reaction] = (reactions[reaction] || 0) + 1;
     
-    // Broadcast reaction to room
     io.to(pin).emit('message_reaction', {
       messageId: messageId,
       reaction: reaction
@@ -193,17 +315,20 @@ io.on('connection', (socket) => {
   socket.on('unsend_message', (data) => {
     const { pin, messageId } = data;
     
-    // Remove message from history
     if (chatHistory.has(pin)) {
       chatHistory.set(pin, chatHistory.get(pin).filter(msg => msg.messageId !== messageId));
+      
+      // Update binData
+      const roomIndex = binData.rooms.findIndex(r => r.pin === pin);
+      if (roomIndex !== -1) {
+        binData.rooms[roomIndex].messages = chatHistory.get(pin);
+      }
     }
     
-    // Remove message status
     if (messageStatus.has(messageId)) {
       messageStatus.delete(messageId);
     }
     
-    // Broadcast unsend to all users in the room
     io.to(pin).emit('message_unsent', {
       messageId: messageId
     });
@@ -224,17 +349,28 @@ io.on('connection', (socket) => {
   socket.on('change_theme', (data) => {
     const { pin, theme } = data;
     
-    // Store theme for the room
     roomThemes.set(pin, theme);
     
-    // Broadcast theme change to all users in the room
+    // Update binData
+    const roomIndex = binData.rooms.findIndex(r => r.pin === pin);
+    if (roomIndex !== -1) {
+      binData.rooms[roomIndex].theme = theme;
+    }
+    
     io.to(pin).emit('theme_changed', { theme: theme });
   });
 
   socket.on('delete_room', (data) => {
     const { pin } = data;
     
-    // Clear room data
+    // Mark room as deleted in binData (don't remove from binData)
+    const roomIndex = binData.rooms.findIndex(r => r.pin === pin);
+    if (roomIndex !== -1) {
+      binData.rooms[roomIndex].status = 'deleted';
+      binData.rooms[roomIndex].deletedAt = new Date().toISOString();
+    }
+    
+    // Clear room data from memory
     if (rooms.has(pin)) {
       rooms.delete(pin);
     }
@@ -248,12 +384,10 @@ io.on('connection', (socket) => {
       roomUsers.delete(pin);
     }
     
-    // Clear message status for this room
     Array.from(messageStatus.keys()).forEach(messageId => {
       messageStatus.delete(messageId);
     });
     
-    // Notify all users in the room
     io.to(pin).emit('room_deleted');
     
     console.log(`Room ${pin} deleted`);
@@ -263,22 +397,23 @@ io.on('connection', (socket) => {
     const { pin } = data;
     
     if (socket.room === pin) {
-      // Remove user from room
       if (rooms.has(pin)) {
         rooms.get(pin).delete(socket.id);
         
-        // Remove user from room users
         if (roomUsers.has(pin)) {
           roomUsers.set(pin, roomUsers.get(pin).filter(user => user.socketId !== socket.id));
-          
-          // Update current users list
           io.to(pin).emit('current_users', { users: roomUsers.get(pin) });
         }
         
-        // Update user count
         io.to(pin).emit('user_count_update', { count: rooms.get(pin).size });
         
-        // If room is empty, delete it after a delay
+        // Update user count in binData
+        const roomIndex = binData.rooms.findIndex(r => r.pin === pin);
+        if (roomIndex !== -1) {
+          binData.rooms[roomIndex].userCount = rooms.get(pin).size;
+          binData.rooms[roomIndex].lastActive = new Date().toISOString();
+        }
+        
         if (rooms.get(pin).size === 0) {
           setTimeout(() => {
             if (rooms.has(pin) && rooms.get(pin).size === 0) {
@@ -289,11 +424,17 @@ io.on('connection', (socket) => {
               if (roomUsers.has(pin)) {
                 roomUsers.delete(pin);
               }
+              
+              // Mark room as inactive in binData
+              const roomIndex = binData.rooms.findIndex(r => r.pin === pin);
+              if (roomIndex !== -1) {
+                binData.rooms[roomIndex].status = 'inactive';
+              }
+              
               console.log(`Room ${pin} cleared (no users)`);
             }
-          }, 30000); // Wait 30 seconds before clearing empty room
+          }, 30000);
         } else {
-          // Notify others that user left
           socket.to(pin).emit('user_left', { 
             message: 'A user left the chat',
             userName: socket.userName
@@ -310,22 +451,23 @@ io.on('connection', (socket) => {
     console.log('User disconnected:', socket.id);
     
     if (socket.room) {
-      // Remove user from room
       if (rooms.has(socket.room)) {
         rooms.get(socket.room).delete(socket.id);
         
-        // Remove user from room users
         if (roomUsers.has(socket.room)) {
           roomUsers.set(socket.room, roomUsers.get(socket.room).filter(user => user.socketId !== socket.id));
-          
-          // Update current users list
           io.to(socket.room).emit('current_users', { users: roomUsers.get(socket.room) });
         }
         
-        // Update user count
         io.to(socket.room).emit('user_count_update', { count: rooms.get(socket.room).size });
         
-        // If room is empty, delete it after a delay
+        // Update user count in binData
+        const roomIndex = binData.rooms.findIndex(r => r.pin === socket.room);
+        if (roomIndex !== -1) {
+          binData.rooms[roomIndex].userCount = rooms.get(socket.room).size;
+          binData.rooms[roomIndex].lastActive = new Date().toISOString();
+        }
+        
         if (rooms.get(socket.room).size === 0) {
           setTimeout(() => {
             if (rooms.has(socket.room) && rooms.get(socket.room).size === 0) {
@@ -336,11 +478,17 @@ io.on('connection', (socket) => {
               if (roomUsers.has(socket.room)) {
                 roomUsers.delete(socket.room);
               }
+              
+              // Mark room as inactive in binData
+              const roomIndex = binData.rooms.findIndex(r => r.pin === socket.room);
+              if (roomIndex !== -1) {
+                binData.rooms[roomIndex].status = 'inactive';
+              }
+              
               console.log(`Room ${socket.room} cleared (no users)`);
             }
-          }, 30000); // Wait 30 seconds before clearing empty room
+          }, 30000);
         } else {
-          // Notify others that user left
           socket.to(socket.room).emit('user_left', { 
             message: 'A user left the chat',
             userName: socket.userName
