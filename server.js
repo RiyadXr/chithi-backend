@@ -1,4 +1,3 @@
-
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
@@ -26,6 +25,148 @@ const chatHistory = new Map();
 const roomUsers = new Map();
 // Store message status (sent, delivered, seen)
 const messageStatus = new Map();
+
+// JSONBin configuration
+const JSONBIN_BIN_ID = '68e223bc43b1c97be95ad96d';
+const JSONBIN_MASTER_KEY = '$2a$10$nCvtrBD0oAjmgXA5JAjTJ.3O5cDYYn7t7QpgqevUchxQTb5V4mBOO';
+const JSONBIN_BASE_URL = 'https://api.jsonbin.io/v3/b';
+
+// Function to save data to JSONBin
+async function saveToJSONBin(data) {
+  try {
+    const response = await fetch(`${JSONBIN_BASE_URL}/${JSONBIN_BIN_ID}`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Master-Key': JSONBIN_MASTER_KEY,
+      },
+      body: JSON.stringify(data)
+    });
+
+    if (!response.ok) {
+      console.error('Failed to save data to JSONBin:', response.statusText);
+      return false;
+    }
+
+    const result = await response.json();
+    console.log('Data saved to JSONBin successfully');
+    return true;
+  } catch (error) {
+    console.error('Error saving to JSONBin:', error);
+    return false;
+  }
+}
+
+// Function to load data from JSONBin
+async function loadFromJSONBin() {
+  try {
+    const response = await fetch(`${JSONBIN_BASE_URL}/${JSONBIN_BIN_ID}/latest`, {
+      method: 'GET',
+      headers: {
+        'X-Master-Key': JSONBIN_MASTER_KEY,
+      }
+    });
+
+    if (!response.ok) {
+      console.error('Failed to load data from JSONBin:', response.statusText);
+      return null;
+    }
+
+    const result = await response.json();
+    console.log('Data loaded from JSONBin successfully');
+    return result.record;
+  } catch (error) {
+    console.error('Error loading from JSONBin:', error);
+    return null;
+  }
+}
+
+// Function to prepare data for JSONBin
+function prepareDataForJSONBin() {
+  const data = {
+    rooms: Array.from(rooms.entries()).reduce((obj, [key, value]) => {
+      obj[key] = Array.from(value);
+      return obj;
+    }, {}),
+    messageReactions: Object.fromEntries(messageReactions),
+    roomThemes: Object.fromEntries(roomThemes),
+    chatHistory: Object.fromEntries(chatHistory),
+    roomUsers: Object.fromEntries(roomUsers),
+    messageStatus: Object.fromEntries(messageStatus),
+    lastUpdated: new Date().toISOString()
+  };
+  return data;
+}
+
+// Function to restore data from JSONBin
+function restoreDataFromJSONBin(data) {
+  if (!data) return;
+
+  try {
+    // Restore rooms
+    if (data.rooms) {
+      Object.entries(data.rooms).forEach(([key, value]) => {
+        rooms.set(key, new Set(value));
+      });
+    }
+
+    // Restore messageReactions
+    if (data.messageReactions) {
+      Object.entries(data.messageReactions).forEach(([key, value]) => {
+        messageReactions.set(key, value);
+      });
+    }
+
+    // Restore roomThemes
+    if (data.roomThemes) {
+      Object.entries(data.roomThemes).forEach(([key, value]) => {
+        roomThemes.set(key, value);
+      });
+    }
+
+    // Restore chatHistory
+    if (data.chatHistory) {
+      Object.entries(data.chatHistory).forEach(([key, value]) => {
+        chatHistory.set(key, value);
+      });
+    }
+
+    // Restore roomUsers
+    if (data.roomUsers) {
+      Object.entries(data.roomUsers).forEach(([key, value]) => {
+        roomUsers.set(key, value);
+      });
+    }
+
+    // Restore messageStatus
+    if (data.messageStatus) {
+      Object.entries(data.messageStatus).forEach(([key, value]) => {
+        messageStatus.set(key, value);
+      });
+    }
+
+    console.log('Data restored from JSONBin successfully');
+  } catch (error) {
+    console.error('Error restoring data from JSONBin:', error);
+  }
+}
+
+// Load data from JSONBin when server starts
+loadFromJSONBin().then(data => {
+  if (data) {
+    restoreDataFromJSONBin(data);
+  }
+});
+
+// Function to save data with debouncing to avoid too many requests
+let saveTimeout;
+function debouncedSave() {
+  clearTimeout(saveTimeout);
+  saveTimeout = setTimeout(async () => {
+    const data = prepareDataForJSONBin();
+    await saveToJSONBin(data);
+  }, 2000); // Save after 2 seconds of inactivity
+}
 
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
@@ -99,6 +240,9 @@ io.on('connection', (socket) => {
       });
     }
     
+    // Save to JSONBin
+    debouncedSave();
+    
     console.log(`User ${socket.id} (${userName}) joined room ${pin}`);
   });
 
@@ -150,6 +294,9 @@ io.on('connection', (socket) => {
         status: 'delivered'
       });
     }
+
+    // Save to JSONBin
+    debouncedSave();
   });
 
   socket.on('message_delivered', (data) => {
@@ -170,6 +317,9 @@ io.on('connection', (socket) => {
         }
       }
     }
+
+    // Save to JSONBin
+    debouncedSave();
   });
 
   socket.on('message_reaction', (data) => {
@@ -189,6 +339,9 @@ io.on('connection', (socket) => {
       messageId: messageId,
       reaction: reaction
     });
+
+    // Save to JSONBin
+    debouncedSave();
   });
 
   socket.on('unsend_message', (data) => {
@@ -208,6 +361,9 @@ io.on('connection', (socket) => {
     io.to(pin).emit('message_unsent', {
       messageId: messageId
     });
+
+    // Save to JSONBin
+    debouncedSave();
     
     console.log(`Message ${messageId} unsent in room ${pin}`);
   });
@@ -230,12 +386,15 @@ io.on('connection', (socket) => {
     
     // Broadcast theme change to all users in the room
     io.to(pin).emit('theme_changed', { theme: theme });
+
+    // Save to JSONBin
+    debouncedSave();
   });
 
   socket.on('delete_room', (data) => {
     const { pin } = data;
     
-    // Clear room data
+    // Clear room data (but JSONBin will keep the backup)
     if (rooms.has(pin)) {
       rooms.delete(pin);
     }
@@ -256,6 +415,9 @@ io.on('connection', (socket) => {
     
     // Notify all users in the room
     io.to(pin).emit('room_deleted');
+
+    // Save to JSONBin (this will preserve the data even though we deleted from memory)
+    debouncedSave();
     
     console.log(`Room ${pin} deleted`);
   });
@@ -291,6 +453,9 @@ io.on('connection', (socket) => {
                 roomUsers.delete(pin);
               }
               console.log(`Room ${pin} cleared (no users)`);
+              
+              // Save to JSONBin
+              debouncedSave();
             }
           }, 30000); // Wait 30 seconds before clearing empty room
         } else {
@@ -304,6 +469,9 @@ io.on('connection', (socket) => {
       
       socket.leave(pin);
       socket.room = null;
+
+      // Save to JSONBin
+      debouncedSave();
     }
   });
 
@@ -338,6 +506,9 @@ io.on('connection', (socket) => {
                 roomUsers.delete(socket.room);
               }
               console.log(`Room ${socket.room} cleared (no users)`);
+              
+              // Save to JSONBin
+              debouncedSave();
             }
           }, 30000); // Wait 30 seconds before clearing empty room
         } else {
@@ -348,6 +519,9 @@ io.on('connection', (socket) => {
           });
         }
       }
+
+      // Save to JSONBin
+      debouncedSave();
     }
   });
 });
